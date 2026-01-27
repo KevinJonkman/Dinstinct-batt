@@ -120,6 +120,29 @@ Access the web interface at `http://<ESP32_IP>/`
 
 MIT License
 
+## Current Status (27 Jan 2025)
+
+**Versie: 7.2** - STOP button fix voor trage Delta PSU
+
+### Wat werkt:
+- Laden/ontladen met Delta SM70-CP-450
+- STOP knop reageert nu tijdens tests
+- Safety limits en bevestigingsdialogen
+- CV/CC mode indicator
+- Cable loss detectie
+- Data logging naar SPIFFS
+
+### Bekende issues:
+- Scherm update is traag (door Delta communicatie)
+- Delta queries blokkeren nog steeds ~800ms per query
+
+### TODO volgende sessie:
+1. **Blue LED status indicator op ESP32**
+   - Knipperen = normaal draaiend
+   - Continu aan = vastgelopen/frozen
+2. Optimaliseer Delta query frequentie
+3. Mogelijk async Delta communicatie
+
 ## Author
 
 Dinstinct / BTAC
