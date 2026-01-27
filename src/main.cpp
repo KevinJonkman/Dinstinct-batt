@@ -39,7 +39,7 @@
 
 const char* WIFI_SSID = "BTAC Medewerkers";
 const char* WIFI_PASS = "Next3600$!";
-const char* DELTA_IP = "192.168.1.27";
+const char* DELTA_IP = "192.168.1.16";
 const int DELTA_PORT = 8462;
 
 #define ONE_WIRE_BUS 13
@@ -62,6 +62,9 @@ DallasTemperature tempSensor(&oneWire);
 Preferences prefs;
 
 volatile bool stopRequested = false;
+
+// Forward declaration for quick stop
+void quickDeltaOff();
 
 // MLX90640 variables
 Adafruit_MLX90640 mlxSensor;
@@ -449,9 +452,10 @@ void beepThermalWarn(){playTone(2000,100);playSilence(100);playTone(2000,100);}
 
 bool deltaConnect() {
   deltaClient.stop();
-  delay(100);
+  delay(200);
+  yield();
 
-  deltaClient.setTimeout(3);
+  deltaClient.setTimeout(10);  // Increased timeout for slow Delta
   if (!deltaClient.connect(DELTA_IP, DELTA_PORT)) {
     Serial.println("[DELTA] Connect FAILED");
     status.deltaConnected = false;
@@ -459,7 +463,8 @@ bool deltaConnect() {
   }
 
   status.deltaConnected = true;
-  delay(100);
+  delay(300);  // Give Delta time to be ready
+  yield();
   while(deltaClient.available()) deltaClient.read();
   return true;
 }
@@ -469,19 +474,27 @@ String deltaQuery(String cmd) {
     if (!deltaConnect()) return "";
   }
 
+  yield();
+  server.handleClient();  // Handle web requests!
+
   while(deltaClient.available()) deltaClient.read();
 
   deltaClient.print(cmd + "\n");
   deltaClient.flush();
+  delay(30);
 
   String response = "";
   unsigned long start = millis();
+  unsigned long timeout = 800;  // Shorter timeout - don't block too long
 
-  while ((millis() - start) < 1000) {
+  while ((millis() - start) < timeout) {
+    yield();
+    server.handleClient();  // Keep handling web requests!
+
     if (deltaClient.available()) {
       char c = deltaClient.read();
       if (c >= 32 && c <= 126) response += c;
-      start = millis();
+      if (response.length() > 3) break;  // Got response, exit early
     } else {
       delay(5);
     }
@@ -495,9 +508,13 @@ void deltaSet(String cmd) {
   if (!deltaClient.connected()) {
     if (!deltaConnect()) return;
   }
+  yield();
+  server.handleClient();  // Handle web requests!
   deltaClient.print(cmd + "\n");
   deltaClient.flush();
   delay(50);
+  yield();
+  server.handleClient();  // Handle web requests!
 }
 
 bool deltaSetupCharge(float voltage, float current) {
@@ -505,26 +522,40 @@ bool deltaSetupCharge(float voltage, float current) {
 
   if (!deltaConnect()) return false;
 
+  yield();
   deltaSet("OUTPut OFF");
-  delay(200);
+  delay(500);  // Extra time for Delta to turn off
+  yield();
 
   deltaSet("SYSTem:REMote:CV Remote");
+  yield();
   deltaSet("SYSTem:REMote:CC Remote");
+  yield();
   deltaSet("SYSTem:REMote:CP Remote");
+  yield();
 
   deltaSet("SOURce:VOLtage " + String(voltage, 2));
+  yield();
   deltaSet("SOURce:CURrent " + String(current, 2));
+  yield();
   float power = voltage * current * 1.5;
   deltaSet("SOURce:POWer " + String(power, 0));
+  yield();
 
   deltaSet("SOURce:CURrent:NEGative 0");
+  yield();
   deltaSet("SOURce:POWer:NEGative 0");
+  yield();
 
+  delay(300);
   deltaSet("OUTPut ON");
-  delay(200);
+  delay(500);  // Extra time for output to stabilize
+  yield();
 
   String vSet = deltaQuery("SOURce:VOLtage?");
+  yield();
   String iSet = deltaQuery("SOURce:CURrent?");
+  yield();
   String pSet = deltaQuery("SOURce:POWer?");
   Serial.printf("[DELTA] Set: V=%s I=%s P=%s\n", vSet.c_str(), iSet.c_str(), pSet.c_str());
 
@@ -536,26 +567,40 @@ bool deltaSetupDischarge(float voltage, float current) {
 
   if (!deltaConnect()) return false;
 
+  yield();
   deltaSet("OUTPut OFF");
-  delay(200);
+  delay(500);  // Extra time for Delta to turn off
+  yield();
 
   deltaSet("SYSTem:REMote:CV Remote");
+  yield();
   deltaSet("SYSTem:REMote:CC Remote");
+  yield();
   deltaSet("SYSTem:REMote:CP Remote");
+  yield();
 
   deltaSet("SOURce:VOLtage " + String(voltage, 2));
+  yield();
   deltaSet("SOURce:CURrent 0");
+  yield();
   deltaSet("SOURce:POWer 0");
+  yield();
 
   deltaSet("SOURce:CURrent:NEGative -" + String(current, 2));
+  yield();
   float power = 70.0 * current * 1.5;
   deltaSet("SOURce:POWer:NEGative -" + String(power, 0));
+  yield();
 
+  delay(300);
   deltaSet("OUTPut ON");
-  delay(200);
+  delay(500);  // Extra time for output to stabilize
+  yield();
 
   String vSet = deltaQuery("SOURce:VOLtage?");
+  yield();
   String iNeg = deltaQuery("SOURce:CURrent:NEGative?");
+  yield();
   String pNeg = deltaQuery("SOURce:POWer:NEGative?");
   Serial.printf("[DELTA] Set: V=%s I-=%s P-=%s\n", vSet.c_str(), iNeg.c_str(), pNeg.c_str());
 
@@ -563,6 +608,12 @@ bool deltaSetupDischarge(float voltage, float current) {
 }
 
 bool deltaReadMeasurements() {
+  // Check stop FIRST
+  if (stopRequested) return false;
+
+  server.handleClient();  // Handle web requests!
+  yield();
+
   if (!deltaClient.connected()) {
     if (!deltaConnect()) {
       status.measureFailCount++;
@@ -570,9 +621,14 @@ bool deltaReadMeasurements() {
     }
   }
 
-  // Read measured values
+  // Check stop between each query
+  if (stopRequested) return false;
   String vStr = deltaQuery("MEASure:VOLtage?");
+
+  if (stopRequested) return false;
   String iStr = deltaQuery("MEASure:CURrent?");
+
+  if (stopRequested) return false;
   String pStr = deltaQuery("MEASure:POWer?");
 
   if (vStr.length() == 0) {
@@ -596,9 +652,17 @@ bool deltaReadMeasurements() {
     status.current = i;
     status.power = p;
 
-    // Read programmed/set values
+    // Read programmed/set values - but check stop between each!
+    if (stopRequested) return false;
+    server.handleClient();
     String setVStr = deltaQuery("SOURce:VOLtage?");
+
+    if (stopRequested) return false;
+    server.handleClient();
     String setIStr = deltaQuery("SOURce:CURrent?");
+
+    if (stopRequested) return false;
+    server.handleClient();
     String setINegStr = deltaQuery("SOURce:CURrent:NEGative?");
 
     if (setVStr.length() > 0) {
@@ -656,15 +720,23 @@ bool deltaReadMeasurements() {
 }
 
 void deltaStop() {
-  Serial.println("[DELTA] STOP");
+  Serial.println("[DELTA] STOP - Emergency shutdown");
 
-  if (deltaConnect()) {
-    deltaSet("OUTPut OFF");
-    delay(100);
+  // Try multiple times to ensure output is off
+  for (int attempt = 0; attempt < 3; attempt++) {
+    yield();
+    if (deltaClient.connected() || deltaConnect()) {
+      deltaClient.print("OUTPut OFF\n");
+      deltaClient.flush();
+      delay(200);
+      yield();
+      Serial.printf("[DELTA] Stop attempt %d sent\n", attempt + 1);
+    }
   }
 
   deltaClient.stop();
   status.deltaConnected = false;
+  Serial.println("[DELTA] Output disabled, connection closed");
 }
 
 String deltaPing() {
@@ -770,7 +842,9 @@ void stopTest() {
   status.running = false;
   status.mode = MODE_IDLE;
   stopRequested = false;
-  deltaStop();
+
+  // Use quick off instead of full deltaStop
+  quickDeltaOff();
   beepStop();
 }
 
@@ -1593,10 +1667,19 @@ void handleCycle() {
 }
 
 void handleStop() {
+  Serial.println("[WEB] STOP requested - setting flag only!");
+
+  // ONLY set flags - do NOT call deltaStop here!
+  // The main loop will handle the actual stop
   stopRequested = true;
   status.running = false;
-  deltaStop();
-  server.send(200, "application/json", "{\"ok\":true}");
+  status.mode = MODE_IDLE;
+
+  // Send response immediately
+  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Stop flag set\"}");
+
+  // Log it
+  Serial.println("[WEB] Stop flag set, returning to browser");
 }
 
 void handleSave() {
@@ -1877,24 +1960,68 @@ void setup() {
 }
 
 // ============== LOOP ==============
+
+// Quick Delta off - minimal blocking
+void quickDeltaOff() {
+  Serial.println("[DELTA] Quick OFF - single attempt");
+  if (deltaClient.connected()) {
+    deltaClient.print("OUTPut OFF\n");
+    deltaClient.flush();
+    delay(100);
+  }
+  deltaClient.stop();
+  status.deltaConnected = false;
+}
+
 void loop() {
+  // Handle web requests first - highest priority
   server.handleClient();
+  yield();
+
+  // Check for stop request - handle with minimal blocking
+  static bool stopInProgress = false;
+  if (stopRequested && !stopInProgress) {
+    stopInProgress = true;
+    Serial.println("[LOOP] Processing stop request...");
+
+    // Quick Delta off - don't wait for confirmation
+    quickDeltaOff();
+
+    status.running = false;
+    status.mode = MODE_IDLE;
+    stopRequested = false;
+    stopInProgress = false;
+
+    logSafetyEvent("STOP executed via loop");
+    beepStop();
+    Serial.println("[LOOP] Stop complete");
+    return;
+  }
 
   // Read thermal camera
   if (mlxConnected) {
     mlxRead();
+    yield();
   }
 
+  // Update test every 2 seconds (increased for slow Delta)
   static unsigned long lastUpd = 0;
-  if (millis() - lastUpd >= 1000) {
+  if (millis() - lastUpd >= 2000) {
     lastUpd = millis();
-    if (status.running) updateTest();
+    if (status.running && !stopRequested) {
+      updateTest();
+      yield();
+    }
   }
 
+  // Read temperature every 5 seconds when idle
   static unsigned long lastTemp = 0;
   if (millis() - lastTemp >= 5000) {
     lastTemp = millis();
-    if (!status.running) readTemp();
+    if (!status.running) {
+      readTemp();
+      yield();
+    }
   }
 
   delay(10);
