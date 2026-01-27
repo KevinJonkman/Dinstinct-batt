@@ -1,0 +1,1902 @@
+/*
+ * Battery Tester v7.1 - WITH MLX90640 THERMAL CAMERA + SAFETY
+ * Based on v7.0 + comprehensive safety features
+ *
+ * Hardware:
+ * - ESP32 LyraT v1.2
+ * - DS18B20 temp sensor on GPIO13
+ * - MLX90640 thermal camera on I2C (GPIO18/23)
+ * - Delta SM70-CP-450 power supply via TCP
+ *
+ * Safety Features:
+ * - Hard limits that require safety code to change
+ * - Confirmation dialogs for all operations
+ * - All setting changes are logged
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <driver/i2s.h>
+#include <Preferences.h>
+#include <SPIFFS.h>
+#include <FS.h>
+
+// Adafruit MLX90640 library
+#include <Adafruit_MLX90640.h>
+
+// Data logging settings
+#define LOG_FILE "/datalog.csv"
+#define SAFETY_LOG_FILE "/safety.log"
+#define MAX_LOG_SIZE 500000  // 500KB max log size
+#define LOG_INTERVAL_MS 5000 // Log every 5 seconds when running
+
+// Default safety code (change this!)
+#define DEFAULT_SAFETY_CODE "1234"
+
+const char* WIFI_SSID = "BTAC Medewerkers";
+const char* WIFI_PASS = "Next3600$!";
+const char* DELTA_IP = "192.168.1.27";
+const int DELTA_PORT = 8462;
+
+#define ONE_WIRE_BUS 13
+#define PA_ENABLE_PIN   21
+#define I2C_SDA_PIN     18
+#define I2C_SCL_PIN     23
+#define ES8311_ADDR     0x18
+#define SAMPLE_RATE     16000
+#define I2S_NUM         I2S_NUM_0
+#define I2S_MCLK_PIN    0
+#define I2S_BCLK_PIN    5
+#define I2S_LRCK_PIN    25
+#define I2S_DOUT_PIN    26
+#define I2S_DIN_PIN     35
+
+WebServer server(80);
+WiFiClient deltaClient;
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature tempSensor(&oneWire);
+Preferences prefs;
+
+volatile bool stopRequested = false;
+
+// MLX90640 variables
+Adafruit_MLX90640 mlxSensor;
+#define MLX_COLS 32
+#define MLX_ROWS 24
+#define MLX_PIXELS (MLX_COLS * MLX_ROWS)
+float mlxFrame[MLX_PIXELS];
+float mlxMin = 0, mlxMax = 0, mlxAvg = 0;
+bool mlxConnected = false;
+unsigned long lastMlxRead = 0;
+#define MLX_REFRESH_MS 500  // Read thermal every 500ms
+
+enum TestMode { MODE_IDLE, MODE_CHARGE, MODE_DISCHARGE, MODE_CYCLE };
+
+// SAFETY LIMITS - These are the absolute boundaries that protect the battery
+// These can ONLY be changed with the safety code
+struct {
+  // Voltage limits (for Li-ion: typically 2.5V-4.25V per cell)
+  float absMinVoltage = 2.50;   // Absolute minimum voltage allowed
+  float absMaxVoltage = 4.25;   // Absolute maximum voltage allowed
+
+  // Current limits (depends on your battery and PSU)
+  float absMaxChargeCurrent = 30.0;     // Max charge current allowed
+  float absMaxDischargeCurrent = 30.0;  // Max discharge current allowed
+
+  // Warning thresholds - values above these trigger confirmation
+  float warnHighCurrent = 10.0;   // Warn if current > this
+  float warnHighVoltage = 4.22;   // Warn if charge voltage > this
+  float warnLowVoltage = 2.60;    // Warn if discharge voltage < this
+
+  // Safety code for changing limits
+  String safetyCode = DEFAULT_SAFETY_CODE;
+} safetyLimits;
+
+// Normal operating config (within safety limits)
+struct {
+  float minVoltage = 2.71;
+  float maxVoltage = 4.20;
+  float chargeCurrent = 24.0;
+  float dischargeCurrent = 24.0;
+  float tempAlarm = 45.0;
+  float thermalAlarm = 60.0;  // Thermal camera alarm
+  int numCycles = 4;
+  int logInterval = 10;
+} config;
+
+struct {
+  TestMode mode = MODE_IDLE;
+  volatile bool running = false;
+  int currentCycle = 0;
+  float voltage = 0.0;
+  float current = 0.0;
+  float power = 0.0;
+  float temperature = 0.0;
+  float totalWh = 0.0;
+  float totalAhCharge = 0.0;
+  float totalAhDischarge = 0.0;
+  unsigned long startTime = 0;
+  unsigned long lastLogTime = 0;
+  unsigned long lastMeasureTime = 0;
+  String lastError = "";
+  bool deltaConnected = false;
+  int measureFailCount = 0;
+  unsigned long lowCurrentStartTime = 0;
+  bool lowCurrentActive = false;
+  // Delta extended info
+  float setVoltage = 0.0;      // Programmed voltage
+  float setCurrent = 0.0;      // Programmed current (positive)
+  float setCurrentNeg = 0.0;   // Programmed current (negative/discharge)
+  bool cvMode = false;         // true = Constant Voltage, false = Constant Current
+  float cableLoss = 0.0;       // Voltage drop in cables
+} status;
+
+// ============== MLX90640 THERMAL CAMERA ==============
+
+bool mlxInit() {
+  Serial.println("[MLX] Initializing...");
+
+  if (!mlxSensor.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
+    Serial.println("[MLX] Not found on I2C");
+    return false;
+  }
+
+  // Set to 4Hz refresh rate (good balance)
+  mlxSensor.setRefreshRate(MLX90640_4_HZ);
+
+  // Set to chess pattern for better accuracy
+  mlxSensor.setMode(MLX90640_CHESS);
+
+  // Set resolution
+  mlxSensor.setResolution(MLX90640_ADC_18BIT);
+
+  Serial.println("[MLX] Initialized OK - 32x24 @ 4Hz");
+  return true;
+}
+
+void mlxRead() {
+  if (!mlxConnected) return;
+  if (millis() - lastMlxRead < MLX_REFRESH_MS) return;
+  lastMlxRead = millis();
+
+  if (mlxSensor.getFrame(mlxFrame) != 0) {
+    return;  // Error reading frame
+  }
+
+  // Calculate min/max/avg
+  mlxMin = 1000;
+  mlxMax = -40;
+  float sum = 0;
+  int validCount = 0;
+
+  for (int i = 0; i < MLX_PIXELS; i++) {
+    float t = mlxFrame[i];
+    if (t > -40 && t < 300) {  // Valid range
+      if (t < mlxMin) mlxMin = t;
+      if (t > mlxMax) mlxMax = t;
+      sum += t;
+      validCount++;
+    }
+  }
+
+  if (validCount > 0) {
+    mlxAvg = sum / validCount;
+  }
+}
+
+// ============== DATA LOGGING ==============
+unsigned long lastLogWrite = 0;
+bool loggingEnabled = false;
+
+bool spiffsReady = false;
+
+void initSPIFFS() {
+  Serial.println("[SPIFFS] Initializing...");
+
+  // Try to mount - if it fails, skip (don't format, takes too long)
+  if (SPIFFS.begin(false)) {
+    spiffsReady = true;
+    Serial.printf("[SPIFFS] Mounted OK - Total: %u, Used: %u bytes\n",
+      SPIFFS.totalBytes(), SPIFFS.usedBytes());
+  } else {
+    Serial.println("[SPIFFS] Not available - logging disabled");
+    Serial.println("[SPIFFS] To enable: run 'pio run -t uploadfs' once");
+    spiffsReady = false;
+  }
+}
+
+void startNewLog() {
+  if (!spiffsReady) return;
+
+  // Create new log file with header
+  File f = SPIFFS.open(LOG_FILE, FILE_WRITE);
+  if (f) {
+    f.println("timestamp,voltage,current,power,temp_ds18b20,temp_thermal_max,mode,ah_charge,ah_discharge,wh");
+    f.close();
+    loggingEnabled = true;
+    Serial.println("[LOG] New log started");
+  }
+}
+
+void appendLogEntry() {
+  if (!spiffsReady || !loggingEnabled || !status.running) return;
+  if (millis() - lastLogWrite < LOG_INTERVAL_MS) return;
+  lastLogWrite = millis();
+
+  // Check file size
+  File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
+  if (!f) return;
+
+  if (f.size() > MAX_LOG_SIZE) {
+    f.close();
+    Serial.println("[LOG] Max size reached, stopping log");
+    loggingEnabled = false;
+    return;
+  }
+
+  // Get elapsed time in seconds
+  unsigned long elapsed = (millis() - status.startTime) / 1000;
+
+  // Mode string
+  const char* modeStr = "IDLE";
+  if (status.mode == MODE_CHARGE) modeStr = "CHARGE";
+  else if (status.mode == MODE_DISCHARGE) modeStr = "DISCHARGE";
+  else if (status.mode == MODE_CYCLE) modeStr = status.current >= 0 ? "CYCLE_CHG" : "CYCLE_DIS";
+
+  // Write CSV line
+  f.printf("%lu,%.4f,%.3f,%.2f,%.2f,%.2f,%s,%.4f,%.4f,%.3f\n",
+    elapsed, status.voltage, status.current, status.power,
+    status.temperature, mlxMax, modeStr,
+    status.totalAhCharge, status.totalAhDischarge, status.totalWh);
+  f.close();
+}
+
+void deleteLog() {
+  if (!spiffsReady) return;
+  SPIFFS.remove(LOG_FILE);
+  loggingEnabled = false;
+  Serial.println("[LOG] Log deleted");
+}
+
+size_t getLogSize() {
+  if (!spiffsReady) return 0;
+  File f = SPIFFS.open(LOG_FILE, FILE_READ);
+  if (!f) return 0;
+  size_t s = f.size();
+  f.close();
+  return s;
+}
+
+// ============== CONFIG ==============
+void saveConfig() {
+  prefs.begin("bt", false);
+  prefs.putFloat("minV", config.minVoltage);
+  prefs.putFloat("maxV", config.maxVoltage);
+  prefs.putFloat("chgI", config.chargeCurrent);
+  prefs.putFloat("disI", config.dischargeCurrent);
+  prefs.putFloat("tmpA", config.tempAlarm);
+  prefs.putFloat("thrmA", config.thermalAlarm);
+  prefs.putInt("cyc", config.numCycles);
+  prefs.putInt("logI", config.logInterval);
+  prefs.end();
+}
+
+void loadConfig() {
+  prefs.begin("bt", true);
+  config.minVoltage = prefs.getFloat("minV", 2.71);
+  config.maxVoltage = prefs.getFloat("maxV", 4.20);
+  config.chargeCurrent = prefs.getFloat("chgI", 24.0);
+  config.dischargeCurrent = prefs.getFloat("disI", 24.0);
+  config.tempAlarm = prefs.getFloat("tmpA", 45.0);
+  config.thermalAlarm = prefs.getFloat("thrmA", 60.0);
+  config.numCycles = prefs.getInt("cyc", 4);
+  config.logInterval = prefs.getInt("logI", 10);
+  prefs.end();
+  Serial.printf("[CFG] V:%.2f-%.2f I:%.1f/%.1f T:%.0f TH:%.0f C:%d\n",
+    config.minVoltage, config.maxVoltage, config.chargeCurrent,
+    config.dischargeCurrent, config.tempAlarm, config.thermalAlarm, config.numCycles);
+}
+
+// ============== SAFETY LIMITS ==============
+void saveSafetyLimits() {
+  prefs.begin("safety", false);
+  prefs.putFloat("absMinV", safetyLimits.absMinVoltage);
+  prefs.putFloat("absMaxV", safetyLimits.absMaxVoltage);
+  prefs.putFloat("absMaxCI", safetyLimits.absMaxChargeCurrent);
+  prefs.putFloat("absMaxDI", safetyLimits.absMaxDischargeCurrent);
+  prefs.putFloat("warnHiI", safetyLimits.warnHighCurrent);
+  prefs.putFloat("warnHiV", safetyLimits.warnHighVoltage);
+  prefs.putFloat("warnLoV", safetyLimits.warnLowVoltage);
+  prefs.putString("code", safetyLimits.safetyCode);
+  prefs.end();
+}
+
+void loadSafetyLimits() {
+  prefs.begin("safety", true);
+  safetyLimits.absMinVoltage = prefs.getFloat("absMinV", 2.50);
+  safetyLimits.absMaxVoltage = prefs.getFloat("absMaxV", 4.25);
+  safetyLimits.absMaxChargeCurrent = prefs.getFloat("absMaxCI", 30.0);
+  safetyLimits.absMaxDischargeCurrent = prefs.getFloat("absMaxDI", 30.0);
+  safetyLimits.warnHighCurrent = prefs.getFloat("warnHiI", 10.0);
+  safetyLimits.warnHighVoltage = prefs.getFloat("warnHiV", 4.22);
+  safetyLimits.warnLowVoltage = prefs.getFloat("warnLoV", 2.60);
+  safetyLimits.safetyCode = prefs.getString("code", DEFAULT_SAFETY_CODE);
+  prefs.end();
+  Serial.printf("[SAFETY] Limits: V:%.2f-%.2f A:%.1f/%.1f Warn:%.1fA\n",
+    safetyLimits.absMinVoltage, safetyLimits.absMaxVoltage,
+    safetyLimits.absMaxChargeCurrent, safetyLimits.absMaxDischargeCurrent,
+    safetyLimits.warnHighCurrent);
+}
+
+// Log safety-related events
+void logSafetyEvent(const String& event) {
+  Serial.printf("[SAFETY LOG] %s\n", event.c_str());
+
+  if (!spiffsReady) return;
+
+  File f = SPIFFS.open(SAFETY_LOG_FILE, FILE_APPEND);
+  if (f) {
+    // Get uptime as timestamp
+    unsigned long secs = millis() / 1000;
+    f.printf("[%lu] %s\n", secs, event.c_str());
+    f.close();
+  }
+}
+
+// Validate charge parameters - returns error message or empty string if OK
+String validateChargeParams(float voltage, float current) {
+  if (voltage > safetyLimits.absMaxVoltage) {
+    return "BLOCKED: Voltage " + String(voltage, 2) + "V exceeds maximum " +
+           String(safetyLimits.absMaxVoltage, 2) + "V";
+  }
+  if (voltage < safetyLimits.absMinVoltage) {
+    return "BLOCKED: Voltage " + String(voltage, 2) + "V below minimum " +
+           String(safetyLimits.absMinVoltage, 2) + "V";
+  }
+  if (current > safetyLimits.absMaxChargeCurrent) {
+    return "BLOCKED: Current " + String(current, 1) + "A exceeds maximum " +
+           String(safetyLimits.absMaxChargeCurrent, 1) + "A";
+  }
+  if (current < 0.1) {
+    return "BLOCKED: Current too low";
+  }
+  return "";  // OK
+}
+
+// Validate discharge parameters
+String validateDischargeParams(float voltage, float current) {
+  if (voltage > safetyLimits.absMaxVoltage) {
+    return "BLOCKED: Voltage " + String(voltage, 2) + "V exceeds maximum " +
+           String(safetyLimits.absMaxVoltage, 2) + "V";
+  }
+  if (voltage < safetyLimits.absMinVoltage) {
+    return "BLOCKED: Voltage " + String(voltage, 2) + "V below minimum " +
+           String(safetyLimits.absMinVoltage, 2) + "V";
+  }
+  if (current > safetyLimits.absMaxDischargeCurrent) {
+    return "BLOCKED: Current " + String(current, 1) + "A exceeds maximum " +
+           String(safetyLimits.absMaxDischargeCurrent, 1) + "A";
+  }
+  if (current < 0.1) {
+    return "BLOCKED: Current too low";
+  }
+  return "";  // OK
+}
+
+// Get warnings for parameters (not blocking, just warnings)
+String getParamWarnings(float voltage, float current, bool isCharge) {
+  String warnings = "";
+
+  if (current > safetyLimits.warnHighCurrent) {
+    warnings += "HIGH CURRENT (" + String(current, 1) + "A)! ";
+  }
+
+  if (isCharge && voltage > safetyLimits.warnHighVoltage) {
+    warnings += "HIGH VOLTAGE (" + String(voltage, 2) + "V)! ";
+  }
+
+  if (!isCharge && voltage < safetyLimits.warnLowVoltage) {
+    warnings += "LOW CUTOFF (" + String(voltage, 2) + "V)! ";
+  }
+
+  return warnings;
+}
+
+// ============== AUDIO ==============
+void es8311_init() {
+  Wire.beginTransmission(ES8311_ADDR); Wire.write(0x00); Wire.write(0x1F); Wire.endTransmission(); delay(20);
+  Wire.beginTransmission(ES8311_ADDR); Wire.write(0x00); Wire.write(0x00); Wire.endTransmission(); delay(20);
+  uint8_t r[][2]={{0x01,0x3F},{0x02,0x00},{0x03,0x10},{0x04,0x10},{0x05,0x00},{0x09,0x0C},{0x0A,0x0C},
+    {0x0D,0x01},{0x0E,0x02},{0x0F,0x44},{0x10,0x0C},{0x32,0xC0},{0x00,0x80},{0x01,0x3F},{0x14,0x1A},{0x12,0x00},{0x13,0x10}};
+  for(auto &x:r){Wire.beginTransmission(ES8311_ADDR);Wire.write(x[0]);Wire.write(x[1]);Wire.endTransmission();}
+  delay(50);
+}
+
+void i2s_init() {
+  i2s_config_t cfg={.mode=(i2s_mode_t)(I2S_MODE_MASTER|I2S_MODE_TX),.sample_rate=SAMPLE_RATE,
+    .bits_per_sample=I2S_BITS_PER_SAMPLE_16BIT,.channel_format=I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format=I2S_COMM_FORMAT_STAND_I2S,.intr_alloc_flags=ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count=8,.dma_buf_len=64,.use_apll=true,.tx_desc_auto_clear=true};
+  i2s_pin_config_t pins={.mck_io_num=I2S_MCLK_PIN,.bck_io_num=I2S_BCLK_PIN,
+    .ws_io_num=I2S_LRCK_PIN,.data_out_num=I2S_DOUT_PIN,.data_in_num=I2S_DIN_PIN};
+  i2s_driver_install(I2S_NUM,&cfg,0,NULL);
+  i2s_set_pin(I2S_NUM,&pins);
+}
+
+void playTone(int freq,int ms){
+  int samples=(SAMPLE_RATE*ms)/1000;int16_t buf[128];size_t w;
+  float phase=0,inc=2.0*PI*freq/SAMPLE_RATE;int rem=samples;
+  while(rem>0){int c=min(64,rem);for(int i=0;i<c;i++){
+    int16_t v=(int16_t)(sin(phase)*8000);buf[i*2]=v;buf[i*2+1]=v;
+    phase+=inc;if(phase>=2*PI)phase-=2*PI;}
+  i2s_write(I2S_NUM,buf,c*4,&w,portMAX_DELAY);rem-=c;}
+}
+void playSilence(int ms){int16_t buf[128]={0};size_t w;int rem=(SAMPLE_RATE*ms)/1000;
+  while(rem>0){int c=min(64,rem);i2s_write(I2S_NUM,buf,c*4,&w,portMAX_DELAY);rem-=c;}}
+
+void beepOK(){playTone(1000,100);playSilence(50);playTone(1500,150);}
+void beepFail(){playTone(400,300);}
+void beepStart(){playTone(1000,100);playSilence(100);playTone(1000,100);playSilence(100);playTone(1200,400);}
+void beepStop(){playTone(800,100);playSilence(100);playTone(600,100);}
+void beepDone(){playTone(800,150);playSilence(50);playTone(1000,150);playSilence(50);playTone(1200,150);playSilence(50);playTone(1500,400);}
+void beepThermalWarn(){playTone(2000,100);playSilence(100);playTone(2000,100);}
+
+// ============== DELTA COMMUNICATIE ==============
+
+bool deltaConnect() {
+  deltaClient.stop();
+  delay(100);
+
+  deltaClient.setTimeout(3);
+  if (!deltaClient.connect(DELTA_IP, DELTA_PORT)) {
+    Serial.println("[DELTA] Connect FAILED");
+    status.deltaConnected = false;
+    return false;
+  }
+
+  status.deltaConnected = true;
+  delay(100);
+  while(deltaClient.available()) deltaClient.read();
+  return true;
+}
+
+String deltaQuery(String cmd) {
+  if (!deltaClient.connected()) {
+    if (!deltaConnect()) return "";
+  }
+
+  while(deltaClient.available()) deltaClient.read();
+
+  deltaClient.print(cmd + "\n");
+  deltaClient.flush();
+
+  String response = "";
+  unsigned long start = millis();
+
+  while ((millis() - start) < 1000) {
+    if (deltaClient.available()) {
+      char c = deltaClient.read();
+      if (c >= 32 && c <= 126) response += c;
+      start = millis();
+    } else {
+      delay(5);
+    }
+  }
+
+  response.trim();
+  return response;
+}
+
+void deltaSet(String cmd) {
+  if (!deltaClient.connected()) {
+    if (!deltaConnect()) return;
+  }
+  deltaClient.print(cmd + "\n");
+  deltaClient.flush();
+  delay(50);
+}
+
+bool deltaSetupCharge(float voltage, float current) {
+  Serial.printf("[DELTA] Setup CHARGE: %.2fV %.1fA\n", voltage, current);
+
+  if (!deltaConnect()) return false;
+
+  deltaSet("OUTPut OFF");
+  delay(200);
+
+  deltaSet("SYSTem:REMote:CV Remote");
+  deltaSet("SYSTem:REMote:CC Remote");
+  deltaSet("SYSTem:REMote:CP Remote");
+
+  deltaSet("SOURce:VOLtage " + String(voltage, 2));
+  deltaSet("SOURce:CURrent " + String(current, 2));
+  float power = voltage * current * 1.5;
+  deltaSet("SOURce:POWer " + String(power, 0));
+
+  deltaSet("SOURce:CURrent:NEGative 0");
+  deltaSet("SOURce:POWer:NEGative 0");
+
+  deltaSet("OUTPut ON");
+  delay(200);
+
+  String vSet = deltaQuery("SOURce:VOLtage?");
+  String iSet = deltaQuery("SOURce:CURrent?");
+  String pSet = deltaQuery("SOURce:POWer?");
+  Serial.printf("[DELTA] Set: V=%s I=%s P=%s\n", vSet.c_str(), iSet.c_str(), pSet.c_str());
+
+  return true;
+}
+
+bool deltaSetupDischarge(float voltage, float current) {
+  Serial.printf("[DELTA] Setup DISCHARGE: %.2fV %.1fA\n", voltage, current);
+
+  if (!deltaConnect()) return false;
+
+  deltaSet("OUTPut OFF");
+  delay(200);
+
+  deltaSet("SYSTem:REMote:CV Remote");
+  deltaSet("SYSTem:REMote:CC Remote");
+  deltaSet("SYSTem:REMote:CP Remote");
+
+  deltaSet("SOURce:VOLtage " + String(voltage, 2));
+  deltaSet("SOURce:CURrent 0");
+  deltaSet("SOURce:POWer 0");
+
+  deltaSet("SOURce:CURrent:NEGative -" + String(current, 2));
+  float power = 70.0 * current * 1.5;
+  deltaSet("SOURce:POWer:NEGative -" + String(power, 0));
+
+  deltaSet("OUTPut ON");
+  delay(200);
+
+  String vSet = deltaQuery("SOURce:VOLtage?");
+  String iNeg = deltaQuery("SOURce:CURrent:NEGative?");
+  String pNeg = deltaQuery("SOURce:POWer:NEGative?");
+  Serial.printf("[DELTA] Set: V=%s I-=%s P-=%s\n", vSet.c_str(), iNeg.c_str(), pNeg.c_str());
+
+  return true;
+}
+
+bool deltaReadMeasurements() {
+  if (!deltaClient.connected()) {
+    if (!deltaConnect()) {
+      status.measureFailCount++;
+      return false;
+    }
+  }
+
+  // Read measured values
+  String vStr = deltaQuery("MEASure:VOLtage?");
+  String iStr = deltaQuery("MEASure:CURrent?");
+  String pStr = deltaQuery("MEASure:POWer?");
+
+  if (vStr.length() == 0) {
+    status.measureFailCount++;
+    if (status.measureFailCount >= 3) {
+      Serial.println("[DELTA] Reconnecting...");
+      deltaConnect();
+      status.measureFailCount = 0;
+    }
+    return false;
+  }
+
+  status.measureFailCount = 0;
+
+  float v = vStr.toFloat();
+  float i = iStr.toFloat();
+  float p = pStr.toFloat();
+
+  if (v >= 0 && v <= 100) {
+    status.voltage = v;
+    status.current = i;
+    status.power = p;
+
+    // Read programmed/set values
+    String setVStr = deltaQuery("SOURce:VOLtage?");
+    String setIStr = deltaQuery("SOURce:CURrent?");
+    String setINegStr = deltaQuery("SOURce:CURrent:NEGative?");
+
+    if (setVStr.length() > 0) {
+      status.setVoltage = setVStr.toFloat();
+    }
+    if (setIStr.length() > 0) {
+      status.setCurrent = setIStr.toFloat();
+    }
+    if (setINegStr.length() > 0) {
+      status.setCurrentNeg = abs(setINegStr.toFloat());
+    }
+
+    // Determine CV/CC mode based on whether we're at the voltage or current limit
+    // In CV mode: actual voltage ≈ set voltage, current varies
+    // In CC mode: actual current ≈ set current, voltage varies
+    float targetCurrent = (i >= 0) ? status.setCurrent : status.setCurrentNeg;
+    float voltageDiff = abs(status.setVoltage - v);
+    float currentDiff = abs(targetCurrent - abs(i));
+
+    // If voltage is close to set point and current is not at limit -> CV mode
+    // If current is close to limit -> CC mode
+    if (targetCurrent > 0.1) {
+      float currentRatio = abs(i) / targetCurrent;
+      status.cvMode = (currentRatio < 0.95);  // CV if not at current limit
+    } else {
+      status.cvMode = true;  // No current set, assume CV
+    }
+
+    // Calculate cable loss (difference between set voltage and measured at sense)
+    // Only meaningful when charging (current > 0) and in CV mode
+    if (i > 0.5 && status.cvMode) {
+      status.cableLoss = status.setVoltage - v;
+    } else if (i < -0.5) {
+      // During discharge, sense voltage is higher than "set" due to battery
+      status.cableLoss = v - status.setVoltage;
+    } else {
+      status.cableLoss = 0;
+    }
+
+    if (status.running && status.lastMeasureTime > 0) {
+      float hours = (millis() - status.lastMeasureTime) / 3600000.0;
+      status.totalWh += abs(p) * hours;
+      if (i > 0.01) status.totalAhCharge += i * hours;
+      else if (i < -0.01) status.totalAhDischarge += abs(i) * hours;
+    }
+    status.lastMeasureTime = millis();
+
+    Serial.printf("[M] V=%.3f(set:%.2f) I=%.2f(set:%.1f) %s Loss=%.3fV\n",
+      v, status.setVoltage, i, targetCurrent,
+      status.cvMode ? "CV" : "CC", status.cableLoss);
+    return true;
+  }
+
+  return false;
+}
+
+void deltaStop() {
+  Serial.println("[DELTA] STOP");
+
+  if (deltaConnect()) {
+    deltaSet("OUTPut OFF");
+    delay(100);
+  }
+
+  deltaClient.stop();
+  status.deltaConnected = false;
+}
+
+String deltaPing() {
+  Serial.println("[DELTA] PING");
+
+  if (!deltaConnect()) {
+    beepFail();
+    return "FAIL: Cannot connect";
+  }
+
+  String idn = deltaQuery("*IDN?");
+  deltaClient.stop();
+
+  if (idn.length() > 5) {
+    beepOK();
+    Serial.printf("[DELTA] IDN: %s\n", idn.c_str());
+    return "OK: " + idn;
+  }
+
+  beepFail();
+  return "FAIL: No response";
+}
+
+// ============== TEMPERATURE ==============
+void readTemp() {
+  tempSensor.requestTemperatures();
+  float t = tempSensor.getTempCByIndex(0);
+  if (t > -50 && t < 100 && t != 85.0) status.temperature = t;
+}
+
+// ============== TEST CONTROL ==============
+void resetStats() {
+  status.totalWh = 0;
+  status.totalAhCharge = 0;
+  status.totalAhDischarge = 0;
+  status.startTime = millis();
+  status.lastLogTime = millis();
+  status.lastMeasureTime = millis();
+  status.lastError = "";
+  status.measureFailCount = 0;
+  status.lowCurrentStartTime = 0;
+  status.lowCurrentActive = false;
+  stopRequested = false;
+}
+
+void startCharge(float voltage, float current) {
+  if (status.running) return;
+
+  Serial.printf("\n===== CHARGE %.2fV %.1fA =====\n", voltage, current);
+  resetStats();
+  startNewLog();
+
+  if (!deltaSetupCharge(voltage, current)) {
+    status.lastError = "Delta connect failed";
+    beepFail();
+    return;
+  }
+
+  beepStart();
+  status.mode = MODE_CHARGE;
+  status.running = true;
+}
+
+void startDischarge(float voltage, float current) {
+  if (status.running) return;
+
+  Serial.printf("\n===== DISCHARGE %.2fV %.1fA =====\n", voltage, current);
+  resetStats();
+  startNewLog();
+
+  if (!deltaSetupDischarge(voltage, current)) {
+    status.lastError = "Delta connect failed";
+    beepFail();
+    return;
+  }
+
+  beepStart();
+  status.mode = MODE_DISCHARGE;
+  status.running = true;
+}
+
+void startCycle() {
+  if (status.running) return;
+
+  Serial.printf("\n===== CYCLE %.2f-%.2fV =====\n", config.minVoltage, config.maxVoltage);
+  resetStats();
+  startNewLog();
+
+  if (!deltaSetupCharge(config.maxVoltage, config.chargeCurrent)) {
+    status.lastError = "Delta connect failed";
+    beepFail();
+    return;
+  }
+
+  beepStart();
+  status.mode = MODE_CYCLE;
+  status.running = true;
+  status.currentCycle = 1;
+}
+
+void stopTest() {
+  Serial.println("\n===== STOP =====");
+  status.running = false;
+  status.mode = MODE_IDLE;
+  stopRequested = false;
+  deltaStop();
+  beepStop();
+}
+
+void updateTest() {
+  if (!status.running || stopRequested) {
+    if (stopRequested) stopTest();
+    return;
+  }
+
+  deltaReadMeasurements();
+  readTemp();
+  appendLogEntry();
+
+  if (!status.running) return;
+
+  if (status.measureFailCount >= 10) {
+    status.lastError = "Communication lost";
+    stopTest();
+    beepFail();
+    return;
+  }
+
+  // DS18B20 temp alarm
+  if (status.temperature > config.tempAlarm) {
+    status.lastError = "TEMP ALARM (DS18B20)";
+    stopTest();
+    beepFail();
+    return;
+  }
+
+  // MLX90640 thermal alarm - check max temp
+  if (mlxConnected && mlxMax > config.thermalAlarm) {
+    status.lastError = "THERMAL ALARM (MLX90640): " + String(mlxMax, 1) + "C";
+    stopTest();
+    beepFail();
+    return;
+  }
+
+  // Log
+  if (millis() - status.lastLogTime >= (unsigned long)config.logInterval * 1000) {
+    status.lastLogTime = millis();
+    char modeChar = 'I';
+    if (status.mode == MODE_CHARGE) modeChar = 'C';
+    else if (status.mode == MODE_DISCHARGE) modeChar = 'D';
+    else if (status.mode == MODE_CYCLE) modeChar = status.current >= 0 ? 'C' : 'D';
+    Serial.printf("[%c] V=%.3f I=%.2f T=%.1f TH=%.1f AhC=%.3f AhD=%.3f\n",
+      modeChar, status.voltage, status.current, status.temperature, mlxMax,
+      status.totalAhCharge, status.totalAhDischarge);
+  }
+
+  if (status.voltage < 0.1) return;
+
+  // Mode logic
+  switch (status.mode) {
+    case MODE_CHARGE:
+      if (status.voltage >= config.maxVoltage - 0.02) {
+        if (abs(status.current) < 4.0) {
+          if (!status.lowCurrentActive) {
+            status.lowCurrentActive = true;
+            status.lowCurrentStartTime = millis();
+            Serial.println("[CHARGE] Low current detected, starting 2 min timer");
+          } else if (millis() - status.lowCurrentStartTime >= 120000) {
+            Serial.println("[CHARGE] Target reached (2 min low current)");
+            beepDone();
+            stopTest();
+          }
+        } else {
+          if (status.lowCurrentActive) {
+            Serial.println("[CHARGE] Current increased, timer reset");
+          }
+          status.lowCurrentActive = false;
+          status.lowCurrentStartTime = 0;
+        }
+      }
+      break;
+
+    case MODE_DISCHARGE:
+      if (status.voltage <= config.minVoltage + 0.02) {
+        if (abs(status.current) < 4.0) {
+          if (!status.lowCurrentActive) {
+            status.lowCurrentActive = true;
+            status.lowCurrentStartTime = millis();
+            Serial.println("[DISCHARGE] Low current detected, starting 2 min timer");
+          } else if (millis() - status.lowCurrentStartTime >= 120000) {
+            Serial.println("[DISCHARGE] Target reached (2 min low current)");
+            beepDone();
+            stopTest();
+          }
+        } else {
+          if (status.lowCurrentActive) {
+            Serial.println("[DISCHARGE] Current increased, timer reset");
+          }
+          status.lowCurrentActive = false;
+          status.lowCurrentStartTime = 0;
+        }
+      }
+      break;
+
+    case MODE_CYCLE:
+      if (status.current >= -0.1) {
+        if (status.voltage >= config.maxVoltage - 0.02) {
+          if (abs(status.current) < 4.0) {
+            if (!status.lowCurrentActive) {
+              status.lowCurrentActive = true;
+              status.lowCurrentStartTime = millis();
+              Serial.println("[CYCLE] Charge low current, starting 2 min timer");
+            } else if (millis() - status.lowCurrentStartTime >= 120000) {
+              Serial.printf("[CYCLE %d] Full (2 min low current) -> discharge\n", status.currentCycle);
+              status.lowCurrentActive = false;
+              status.lowCurrentStartTime = 0;
+              deltaStop();
+              delay(2000);
+              deltaSetupDischarge(config.minVoltage, config.dischargeCurrent);
+            }
+          } else {
+            if (status.lowCurrentActive) {
+              Serial.println("[CYCLE] Charge current increased, timer reset");
+            }
+            status.lowCurrentActive = false;
+            status.lowCurrentStartTime = 0;
+          }
+        }
+      } else {
+        if (status.voltage <= config.minVoltage + 0.02) {
+          if (abs(status.current) < 4.0) {
+            if (!status.lowCurrentActive) {
+              status.lowCurrentActive = true;
+              status.lowCurrentStartTime = millis();
+              Serial.println("[CYCLE] Discharge low current, starting 2 min timer");
+            } else if (millis() - status.lowCurrentStartTime >= 120000) {
+              Serial.printf("[CYCLE %d] Empty (2 min low current): %.3f Ah\n", status.currentCycle, status.totalAhDischarge);
+              playTone(1000, 200);
+              status.lowCurrentActive = false;
+              status.lowCurrentStartTime = 0;
+
+              if (status.currentCycle >= config.numCycles) {
+                beepDone();
+                stopTest();
+              } else {
+                status.currentCycle++;
+                status.totalAhDischarge = 0;
+                deltaStop();
+                delay(2000);
+                deltaSetupCharge(config.maxVoltage, config.chargeCurrent);
+              }
+            }
+          } else {
+            if (status.lowCurrentActive) {
+              Serial.println("[CYCLE] Discharge current increased, timer reset");
+            }
+            status.lowCurrentActive = false;
+            status.lowCurrentStartTime = 0;
+          }
+        }
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ============== WEB SERVER ==============
+
+// Color gradient for thermal image (blue -> green -> yellow -> red)
+String getThermalColor(float temp, float minT, float maxT) {
+  if (maxT <= minT) maxT = minT + 1;
+  float ratio = (temp - minT) / (maxT - minT);
+  ratio = constrain(ratio, 0.0, 1.0);
+
+  int r, g, b;
+  if (ratio < 0.25) {
+    float t = ratio / 0.25;
+    r = 0; g = (int)(255 * t); b = 255;
+  } else if (ratio < 0.5) {
+    float t = (ratio - 0.25) / 0.25;
+    r = 0; g = 255; b = (int)(255 * (1 - t));
+  } else if (ratio < 0.75) {
+    float t = (ratio - 0.5) / 0.25;
+    r = (int)(255 * t); g = 255; b = 0;
+  } else {
+    float t = (ratio - 0.75) / 0.25;
+    r = 255; g = (int)(255 * (1 - t)); b = 0;
+  }
+
+  char hex[8];
+  sprintf(hex, "#%02X%02X%02X", r, g, b);
+  return String(hex);
+}
+
+void sendMainPage() {
+  String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<title>Battery Tester v7.0</title>";
+  h += "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>";
+  h += "<link href='https://fonts.googleapis.com/css2?family=DSEG7+Classic:wght@400;700&display=swap' rel='stylesheet'>";
+  h += "<style>";
+  h += "@font-face{font-family:'DSEG7';src:url('https://cdn.jsdelivr.net/npm/dseg@0.46.0/fonts/DSEG7-Classic/DSEG7Classic-Bold.woff2')format('woff2')}";
+  h += "*{box-sizing:border-box;margin:0;padding:0}";
+  h += "body{font-family:sans-serif;background:#1a1a2e;color:#eee;padding:10px}";
+  h += "h1{text-align:center;color:#0cf;margin-bottom:10px}";
+  h += ".main-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}";
+  h += ".full-width{grid-column:1/-1}";
+  h += ".panel{background:#16213e;border-radius:6px;padding:12px;margin-bottom:10px}";
+  h += ".panel h2{color:#0cf;font-size:0.9em;margin-bottom:8px}";
+  h += ".graph-container{height:300px;position:relative}";
+  h += ".thermal-container{text-align:center}";
+  h += ".thermal-img{image-rendering:pixelated;border:2px solid #333;border-radius:4px;max-width:100%}";
+  h += ".thermal-stats{display:flex;justify-content:space-around;margin-top:8px}";
+  h += ".thermal-stat{text-align:center}.thermal-stat .label{font-size:0.7em;color:#888}";
+  h += ".thermal-stat .val{font-size:1.1em;font-weight:bold}";
+  h += ".tmin{color:#00f}.tmax{color:#f00}.tavg{color:#0f0}";
+  // 7-segment display styles
+  h += ".seg-display{display:flex;gap:20px;justify-content:center;margin-bottom:15px;flex-wrap:wrap}";
+  h += ".seg-box{background:#0a0a15;border:2px solid #333;border-radius:8px;padding:15px 25px;text-align:center;min-width:180px}";
+  h += ".seg-label{font-size:0.75em;color:#666;margin-bottom:5px;text-transform:uppercase}";
+  h += ".seg-value{font-family:'DSEG7',monospace;font-size:3em;color:#0f0;text-shadow:0 0 10px #0f0}";
+  h += ".seg-value.voltage{color:#0cf;text-shadow:0 0 10px #0cf}";
+  h += ".seg-value.current{color:#f80;text-shadow:0 0 10px #f80}";
+  h += ".seg-value.current.negative{color:#f44;text-shadow:0 0 10px #f44}";
+  h += ".seg-unit{font-size:0.4em;color:#888;margin-left:5px}";
+  // Small cards
+  h += ".cards{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}";
+  h += ".card{background:#16213e;border-radius:6px;padding:8px;text-align:center}";
+  h += ".card .l{font-size:0.65em;color:#888}.card .v{font-size:1.1em;font-weight:bold;color:#0cf}";
+  h += ".controls{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}";
+  h += ".row{display:flex;justify-content:space-between;font-size:0.85em;padding:3px 0}.row .k{color:#888}";
+  h += "button{padding:8px 12px;border:none;border-radius:6px;font-weight:bold;cursor:pointer;margin:2px}";
+  h += ".bg{background:#0a4;color:#fff}.br{background:#d33;color:#fff}.bb{background:#08c;color:#fff}.bo{background:#c80;color:#fff}.bp{background:#808;color:#fff}";
+  h += "input[type=number]{width:60px;padding:6px;background:#0f0f23;border:1px solid #333;border-radius:4px;color:#fff;text-align:center}";
+  h += ".st{text-align:center;padding:8px;border-radius:6px;margin-bottom:10px;font-weight:bold}";
+  h += ".st.on{background:#0a4}.st.off{background:#555}.st.run{background:#c80}";
+  h += ".err{background:#422;border:1px solid #d33;padding:8px;border-radius:5px;margin-bottom:10px}";
+  h += ".mode-row{display:flex;align-items:center;gap:5px;margin-bottom:8px;flex-wrap:wrap}";
+  h += ".mode-row label{color:#888;font-size:0.8em}";
+  h += ".stop-btn{width:100%;padding:12px;font-size:1.1em}";
+  h += ".log-info{font-size:0.8em;color:#888;margin-left:10px}";
+  h += "@media(max-width:900px){.main-grid{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}.controls{grid-template-columns:1fr}.seg-display{flex-direction:column;align-items:center}}";
+  h += "</style></head><body>";
+
+  h += "<h1>Battery Tester v7.0</h1>";
+  h += "<div class='st' id='st'>Loading...</div>";
+  h += "<div class='err' id='err' style='display:none'></div>";
+
+  // Large 7-segment displays for Voltage and Current
+  h += "<div class='seg-display'>";
+  h += "<div class='seg-box'><div class='seg-label'>Voltage</div><div class='seg-value voltage' id='vBig'>--.---<span class='seg-unit'>V</span></div></div>";
+  h += "<div class='seg-box'><div class='seg-label'>Current</div><div class='seg-value current' id='iBig'>--.--<span class='seg-unit'>A</span></div></div>";
+  h += "<div class='seg-box'><div class='seg-label'>Temperature</div><div class='seg-value' id='tBig'>--.-<span class='seg-unit'>°C</span></div></div>";
+  h += "</div>";
+
+  // Smaller status cards
+  h += "<div class='cards'>";
+  h += "<div class='card'><div class='l'>Ah Charge</div><div class='v' id='ahc'>--</div></div>";
+  h += "<div class='card'><div class='l'>Ah Discharge</div><div class='v' id='ahd'>--</div></div>";
+  h += "<div class='card'><div class='l'>Total Wh</div><div class='v' id='wh'>--</div></div>";
+  h += "<div class='card'><div class='l'>Power</div><div class='v' id='pwr'>--</div></div>";
+  h += "</div>";
+
+  // Delta PSU Status Panel - CV/CC, Set vs Measured, Cable Loss
+  h += "<div class='panel' style='background:#1a2a1a'>";
+  h += "<h2 style='color:#4f8'>Delta PSU Status</h2>";
+  h += "<div style='display:grid;grid-template-columns:repeat(4,1fr);gap:10px;text-align:center'>";
+  // CV/CC Mode indicator
+  h += "<div class='card' style='background:#0a1a0a'><div class='l'>Mode</div>";
+  h += "<div class='v' id='cvcc' style='font-size:1.5em;font-weight:bold'>--</div></div>";
+  // Set Voltage
+  h += "<div class='card' style='background:#0a1a0a'><div class='l'>Set Voltage</div>";
+  h += "<div class='v' id='setV'>--</div></div>";
+  // Set Current
+  h += "<div class='card' style='background:#0a1a0a'><div class='l'>Set Current</div>";
+  h += "<div class='v' id='setI'>--</div></div>";
+  // Cable Loss
+  h += "<div class='card' style='background:#0a1a0a'><div class='l'>Cable Loss</div>";
+  h += "<div class='v' id='cableLoss' style='color:#f80'>--</div></div>";
+  h += "</div>";
+  // Comparison bar
+  h += "<div style='margin-top:10px;padding:10px;background:#0a1a0a;border-radius:6px'>";
+  h += "<div style='display:flex;justify-content:space-between;font-size:0.85em;margin-bottom:5px'>";
+  h += "<span style='color:#888'>Measured vs Set</span>";
+  h += "<span id='compText' style='color:#4f8'>--</span>";
+  h += "</div>";
+  h += "<div style='display:flex;gap:10px'>";
+  h += "<div style='flex:1'><div style='color:#666;font-size:0.7em'>VOLTAGE</div>";
+  h += "<div style='display:flex;align-items:center;gap:5px'>";
+  h += "<span style='color:#0cf' id='measV'>--.---</span>";
+  h += "<span style='color:#666'>vs</span>";
+  h += "<span style='color:#4a8' id='progV'>--.--</span>";
+  h += "<span style='color:#f80;font-size:0.8em' id='vDiff'></span>";
+  h += "</div></div>";
+  h += "<div style='flex:1'><div style='color:#666;font-size:0.7em'>CURRENT</div>";
+  h += "<div style='display:flex;align-items:center;gap:5px'>";
+  h += "<span style='color:#f80' id='measI'>--.--</span>";
+  h += "<span style='color:#666'>vs</span>";
+  h += "<span style='color:#4a8' id='progI'>--.--</span>";
+  h += "<span style='color:#f80;font-size:0.8em' id='iDiff'></span>";
+  h += "</div></div>";
+  h += "</div></div>";
+  h += "</div>";
+
+  // Main grid: Graph left, Thermal right
+  h += "<div class='main-grid'>";
+
+  // Left: Graph
+  h += "<div class='panel'><h2>Real-time Data</h2>";
+  h += "<div class='graph-container'><canvas id='chart'></canvas></div></div>";
+
+  // Right: Thermal
+  h += "<div class='panel'><h2>Thermal Camera</h2>";
+  h += "<div id='mlxStatus'>Checking...</div>";
+  h += "<div class='thermal-container' id='thermalContainer' style='display:none'>";
+  h += "<canvas id='thermal' class='thermal-img' width='320' height='240'></canvas>";
+  h += "<div class='thermal-stats'>";
+  h += "<div class='thermal-stat'><div class='label'>MIN</div><div class='val tmin' id='tmin'>--</div></div>";
+  h += "<div class='thermal-stat'><div class='label'>MAX</div><div class='val tmax' id='tmax'>--</div></div>";
+  h += "<div class='thermal-stat'><div class='label'>AVG</div><div class='val tavg' id='tavg'>--</div></div>";
+  h += "</div></div></div>";
+
+  h += "</div>"; // end main-grid
+
+  // Controls row
+  h += "<div class='controls'>";
+
+  // Charge
+  h += "<div class='panel'><h2>Charge</h2>";
+  h += "<div class='mode-row'><label>V:</label><input type='number' id='chgV' step='0.01' value='4.20'>";
+  h += "<label>A:</label><input type='number' id='chgI' step='0.1' value='5'></div>";
+  h += "<button class='bg' onclick='startChg()'>START</button></div>";
+
+  // Discharge
+  h += "<div class='panel'><h2>Discharge</h2>";
+  h += "<div class='mode-row'><label>V:</label><input type='number' id='disV' step='0.01' value='2.71'>";
+  h += "<label>A:</label><input type='number' id='disI' step='0.1' value='5'></div>";
+  h += "<button class='bo' onclick='startDis()'>START</button></div>";
+
+  // Cycle
+  h += "<div class='panel'><h2>Auto Cycle</h2>";
+  h += "<div class='row'><span class='k'>Range</span><span>" + String(config.minVoltage,2) + "-" + String(config.maxVoltage,2) + "V</span></div>";
+  h += "<div class='row'><span class='k'>Cycle</span><span id='cyc'>0/" + String(config.numCycles) + "</span></div>";
+  h += "<button class='bg' onclick='startCyc()'>START</button></div>";
+
+  h += "</div>"; // end controls
+
+  // Bottom row
+  h += "<div class='panel' style='display:flex;gap:10px;align-items:center;flex-wrap:wrap'>";
+  h += "<button class='br stop-btn' style='flex:1;min-width:150px' onclick='stop()'>STOP</button>";
+  h += "<button class='bb' onclick='ping()'>PING DELTA</button><span id='ds'>-</span>";
+  h += "<button onclick='location.href=\"/settings\"'>Settings</button>";
+  h += "<button onclick='clearChart()'>Clear Graph</button>";
+  h += "</div>";
+
+  // Data logging row
+  h += "<div class='panel' style='display:flex;gap:10px;align-items:center;flex-wrap:wrap'>";
+  h += "<b style='color:#0cf'>Data Log:</b>";
+  h += "<button class='bp' onclick='downloadCSV()'>Download CSV</button>";
+  h += "<button class='br' onclick='deleteLog()'>Delete Log</button>";
+  h += "<span class='log-info' id='logInfo'>-</span>";
+  h += "</div>";
+
+  // JavaScript
+  h += "<script>";
+  h += "function $(i){return document.getElementById(i)}";
+
+  // Chart setup
+  h += "var maxPoints=100,labels=[],vData=[],iData=[],tData=[];";
+  h += "var ctx=$('chart').getContext('2d');";
+  h += "var chart=new Chart(ctx,{type:'line',data:{labels:labels,datasets:[";
+  h += "{label:'Voltage (V)',data:vData,borderColor:'#0cf',backgroundColor:'rgba(0,204,255,0.1)',yAxisID:'y',tension:0.3},";
+  h += "{label:'Current (A)',data:iData,borderColor:'#f80',backgroundColor:'rgba(255,136,0,0.1)',yAxisID:'y1',tension:0.3},";
+  h += "{label:'Temp (C)',data:tData,borderColor:'#f44',backgroundColor:'rgba(255,68,68,0.1)',yAxisID:'y2',tension:0.3}";
+  h += "]},options:{responsive:true,maintainAspectRatio:false,animation:{duration:0},interaction:{intersect:false,mode:'index'},";
+  h += "scales:{x:{display:true,grid:{color:'#333'}},";
+  h += "y:{type:'linear',position:'left',title:{display:true,text:'Voltage',color:'#0cf'},grid:{color:'#333'},ticks:{color:'#0cf'}},";
+  h += "y1:{type:'linear',position:'right',title:{display:true,text:'Current',color:'#f80'},grid:{drawOnChartArea:false},ticks:{color:'#f80'}},";
+  h += "y2:{type:'linear',position:'right',title:{display:true,text:'Temp',color:'#f44'},grid:{drawOnChartArea:false},ticks:{color:'#f44'}}";
+  h += "},plugins:{legend:{labels:{color:'#fff'}}}}});";
+
+  h += "function addData(v,i,t){var now=new Date().toLocaleTimeString();";
+  h += "labels.push(now);vData.push(v);iData.push(i);tData.push(t);";
+  h += "if(labels.length>maxPoints){labels.shift();vData.shift();iData.shift();tData.shift();}";
+  h += "chart.update();}";
+  h += "function clearChart(){labels.length=0;vData.length=0;iData.length=0;tData.length=0;chart.update();}";
+
+  // Thermal canvas
+  h += "var tCanvas=$('thermal'),tCtx=tCanvas.getContext('2d');";
+
+  // Update function
+  h += "function upd(){fetch('/status').then(r=>r.json()).then(d=>{";
+  // 7-segment displays
+  h += "$('vBig').innerHTML=d.v.toFixed(3)+'<span class=\"seg-unit\">V</span>';";
+  h += "var iEl=$('iBig');iEl.innerHTML=d.i.toFixed(2)+'<span class=\"seg-unit\">A</span>';";
+  h += "iEl.className='seg-value current'+(d.i<0?' negative':'');";
+  h += "$('tBig').innerHTML=d.t.toFixed(1)+'<span class=\"seg-unit\">°C</span>';";
+  // Cards
+  h += "$('ahc').innerText=d.ahc.toFixed(3);";
+  h += "$('ahd').innerText=d.ahd.toFixed(3);";
+  h += "$('wh').innerText=d.wh.toFixed(2);";
+  h += "$('pwr').innerText=d.p.toFixed(1)+'W';";
+  h += "$('cyc').innerText=d.cyc+'/'+d.ncyc;";
+  h += "$('ds').innerText=d.delta?'Connected':'Offline';";
+  h += "$('ds').style.color=d.delta?'#0f0':'#f44';";
+  h += "var modes=['IDLE','CHARGING','DISCHARGING','CYCLING'];";
+  h += "var s=$('st');";
+  h += "if(d.run){s.innerText=modes[d.mode];s.className='st run';}";
+  h += "else{s.innerText=d.delta?'Ready':'Offline';s.className='st '+(d.delta?'on':'off');}";
+  h += "var e=$('err');if(d.err&&d.err.length>0){e.innerText=d.err;e.style.display='block';}else{e.style.display='none';}";
+  // Delta PSU extended info
+  h += "var cvcc=$('cvcc');";
+  h += "if(d.delta&&d.run){";
+  h += "cvcc.innerText=d.cvMode?'CV':'CC';";
+  h += "cvcc.style.color=d.cvMode?'#0cf':'#f80';";
+  h += "}else{cvcc.innerText='--';cvcc.style.color='#666';}";
+  h += "$('setV').innerText=d.setV.toFixed(2)+'V';";
+  h += "var activeI=d.i>=0?d.setI:d.setINeg;";
+  h += "$('setI').innerText=activeI.toFixed(1)+'A';";
+  h += "var loss=$('cableLoss');";
+  h += "if(Math.abs(d.cableLoss)>0.001){";
+  h += "loss.innerText=(d.cableLoss>0?'+':'')+d.cableLoss.toFixed(3)+'V';";
+  h += "loss.style.color=Math.abs(d.cableLoss)>0.1?'#f44':'#f80';";
+  h += "}else{loss.innerText='0.000V';loss.style.color='#4f8';}";
+  // Measured vs Set comparison
+  h += "$('measV').innerText=d.v.toFixed(3);";
+  h += "$('progV').innerText=d.setV.toFixed(2);";
+  h += "$('measI').innerText=d.i.toFixed(2);";
+  h += "$('progI').innerText=activeI.toFixed(2);";
+  h += "var vD=d.v-d.setV;";
+  h += "$('vDiff').innerText=(vD>=0?'+':'')+vD.toFixed(3)+'V';";
+  h += "var iD=Math.abs(d.i)-activeI;";
+  h += "$('iDiff').innerText=(iD>=0?'+':'')+iD.toFixed(2)+'A';";
+  // Comparison text
+  h += "var ct=$('compText');";
+  h += "if(!d.delta){ct.innerText='PSU Offline';ct.style.color='#f44';}";
+  h += "else if(!d.run){ct.innerText='Standby';ct.style.color='#888';}";
+  h += "else if(d.cvMode){ct.innerText='Constant Voltage Mode';ct.style.color='#0cf';}";
+  h += "else{ct.innerText='Constant Current Mode';ct.style.color='#f80';}";
+  // Chart data
+  h += "addData(d.v,d.i,d.t);";
+  // Thermal camera
+  h += "if(d.mlx){";
+  h += "$('mlxStatus').style.display='none';$('thermalContainer').style.display='block';";
+  h += "$('tmin').innerText=d.mlxMin.toFixed(1)+'C';";
+  h += "$('tmax').innerText=d.mlxMax.toFixed(1)+'C';";
+  h += "$('tavg').innerText=d.mlxAvg.toFixed(1)+'C';";
+  h += "}else{$('mlxStatus').innerText='MLX90640 not connected';$('thermalContainer').style.display='none';}";
+  h += "}).catch(()=>{$('st').innerText='ESP Offline';$('st').className='st off';})}";
+
+  // Log info update
+  h += "function updLog(){fetch('/loginfo').then(r=>r.json()).then(d=>{";
+  h += "var kb=(d.logSize/1024).toFixed(1);var free=(d.freeSpace/1024).toFixed(0);";
+  h += "$('logInfo').innerText='Size: '+kb+'KB | Free: '+free+'KB'+(d.logging?' | Recording...':'');";
+  h += "}).catch(()=>{})}";
+
+  // Thermal update
+  h += "function updThermal(){var tc=$('thermalContainer');if(!tc||tc.style.display=='none')return;";
+  h += "fetch('/thermaldata').then(r=>r.json()).then(d=>{";
+  h += "if(!d.data)return;var w=32,h=24,scale=10;";
+  h += "for(var y=0;y<h;y++){for(var x=0;x<w;x++){";
+  h += "tCtx.fillStyle=d.colors[y*w+x];tCtx.fillRect(x*scale,y*scale,scale,scale);}}";
+  h += "}).catch(()=>{})}";
+
+  // Safety limits (loaded from server)
+  h += "var safety={absMinV:2.5,absMaxV:4.25,absMaxCI:30,absMaxDI:30,warnHiI:10,warnHiV:4.22,warnLoV:2.6};";
+  h += "fetch('/safety').then(r=>r.json()).then(d=>{safety=d;}).catch(()=>{});";
+
+  // Validation function
+  h += "function validateParams(v,i,isCharge){";
+  h += "var errs=[];";
+  h += "if(v>safety.absMaxV)errs.push('Voltage '+v+'V exceeds max '+safety.absMaxV+'V!');";
+  h += "if(v<safety.absMinV)errs.push('Voltage '+v+'V below min '+safety.absMinV+'V!');";
+  h += "if(isCharge&&i>safety.absMaxCI)errs.push('Current '+i+'A exceeds max '+safety.absMaxCI+'A!');";
+  h += "if(!isCharge&&i>safety.absMaxDI)errs.push('Current '+i+'A exceeds max '+safety.absMaxDI+'A!');";
+  h += "return errs;}";
+
+  // Warning function
+  h += "function getWarnings(v,i,isCharge){";
+  h += "var w=[];";
+  h += "if(i>safety.warnHiI)w.push('HIGH CURRENT: '+i+'A');";
+  h += "if(isCharge&&v>safety.warnHiV)w.push('HIGH VOLTAGE: '+v+'V');";
+  h += "if(!isCharge&&v<safety.warnLoV)w.push('LOW CUTOFF: '+v+'V');";
+  h += "return w;}";
+
+  // Confirmation dialog
+  h += "function confirmStart(mode,v,i,isCharge){";
+  h += "var errs=validateParams(v,i,isCharge);";
+  h += "if(errs.length>0){alert('BLOCKED!\\n\\n'+errs.join('\\n'));return false;}";
+  h += "var warns=getWarnings(v,i,isCharge);";
+  h += "var msg=mode+'\\n\\nVoltage: '+v+'V\\nCurrent: '+i+'A';";
+  h += "if(warns.length>0)msg+='\\n\\n⚠️ WARNINGS:\\n'+warns.join('\\n');";
+  h += "msg+='\\n\\nAre you sure you want to start?';";
+  h += "return confirm(msg);}";
+
+  h += "function ping(){fetch('/ping').then(r=>r.json()).then(d=>{alert(d.result);upd();})}";
+
+  // Charge with confirmation
+  h += "function startChg(){";
+  h += "var v=parseFloat($('chgV').value),i=parseFloat($('chgI').value);";
+  h += "if(!confirmStart('START CHARGING',v,i,true))return;";
+  h += "fetch('/charge?v='+v+'&i='+i).then(r=>r.json()).then(d=>{";
+  h += "if(!d.ok)alert('ERROR: '+d.error);";
+  h += "setTimeout(upd,500);}).catch(e=>alert('Error: '+e));}";
+
+  // Discharge with confirmation
+  h += "function startDis(){";
+  h += "var v=parseFloat($('disV').value),i=parseFloat($('disI').value);";
+  h += "if(!confirmStart('START DISCHARGING',v,i,false))return;";
+  h += "fetch('/discharge?v='+v+'&i='+i).then(r=>r.json()).then(d=>{";
+  h += "if(!d.ok)alert('ERROR: '+d.error);";
+  h += "setTimeout(upd,500);}).catch(e=>alert('Error: '+e));}";
+
+  // Cycle with confirmation
+  h += "function startCyc(){";
+  h += "var msg='START AUTO CYCLE\\n\\nRange: " + String(config.minVoltage,2) + "V - " + String(config.maxVoltage,2) + "V\\n";
+  h += "Charge: " + String(config.chargeCurrent,1) + "A\\nDischarge: " + String(config.dischargeCurrent,1) + "A\\n";
+  h += "Cycles: " + String(config.numCycles) + "\\n\\nAre you sure?';";
+  h += "if(!confirm(msg))return;";
+  h += "fetch('/cycle').then(r=>r.json()).then(d=>{";
+  h += "if(!d.ok)alert('ERROR: '+d.error);";
+  h += "setTimeout(upd,500);}).catch(e=>alert('Error: '+e));}";
+
+  h += "function stop(){if(confirm('STOP the current test?')){fetch('/stop');setTimeout(upd,200)}}";
+  h += "function downloadCSV(){window.location.href='/download'}";
+  h += "function deleteLog(){if(confirm('Delete all logged data?')){fetch('/deletelog').then(()=>updLog())}}";
+  h += "setInterval(upd,2000);setInterval(updThermal,1000);setInterval(updLog,5000);upd();updLog();setTimeout(updThermal,500);";
+  h += "</script></body></html>";
+
+  server.send(200, "text/html", h);
+}
+
+void sendThermalPage() {
+  String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<title>Thermal Camera</title><style>";
+  h += "*{margin:0;padding:0}body{background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;color:#fff}";
+  h += "canvas{image-rendering:pixelated;max-width:100%;border:2px solid #333}";
+  h += ".stats{display:flex;gap:30px;margin:20px;font-size:1.5em}";
+  h += ".stat{text-align:center}.label{font-size:0.6em;color:#888}";
+  h += ".tmin{color:#00f}.tmax{color:#f00}.tavg{color:#0f0}";
+  h += ".back{position:fixed;top:10px;left:10px;padding:10px 20px;background:#333;color:#fff;text-decoration:none;border-radius:5px}";
+  h += "</style></head><body>";
+  h += "<a href='/' class='back'>Back</a>";
+  h += "<h1 style='margin:20px;color:#0cf'>MLX90640 Thermal Camera</h1>";
+  h += "<canvas id='thermal' width='640' height='480'></canvas>";
+  h += "<div class='stats'>";
+  h += "<div class='stat'><div class='label'>MIN</div><div class='tmin' id='tmin'>--</div></div>";
+  h += "<div class='stat'><div class='label'>MAX</div><div class='tmax' id='tmax'>--</div></div>";
+  h += "<div class='stat'><div class='label'>AVG</div><div class='tavg' id='tavg'>--</div></div>";
+  h += "</div>";
+  h += "<script>";
+  h += "var canvas=document.getElementById('thermal'),ctx=canvas.getContext('2d');";
+  h += "function upd(){fetch('/thermaldata').then(r=>r.json()).then(d=>{";
+  h += "if(!d.data)return;var w=32,h=24,scale=20;";
+  h += "for(var y=0;y<h;y++){for(var x=0;x<w;x++){";
+  h += "ctx.fillStyle=d.colors[y*w+x];ctx.fillRect(x*scale,y*scale,scale,scale);}}";
+  h += "document.getElementById('tmin').innerText=d.min.toFixed(1)+'C';";
+  h += "document.getElementById('tmax').innerText=d.max.toFixed(1)+'C';";
+  h += "document.getElementById('tavg').innerText=d.avg.toFixed(1)+'C';";
+  h += "}).catch(()=>{})}";
+  h += "setInterval(upd,500);upd();";
+  h += "</script></body></html>";
+
+  server.send(200, "text/html", h);
+}
+
+void sendSettingsPage() {
+  String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<title>Settings</title><style>";
+  h += "*{box-sizing:border-box;margin:0;padding:0}";
+  h += "body{font-family:sans-serif;background:#1a1a2e;color:#eee;padding:10px;max-width:600px;margin:0 auto}";
+  h += "h1{text-align:center;color:#0cf;margin-bottom:10px}";
+  h += ".panel{background:#16213e;border-radius:6px;padding:15px;margin-bottom:10px}";
+  h += ".panel h2{color:#0cf;font-size:0.95em;margin-bottom:10px}";
+  h += ".panel.safety{background:#2a1a1a;border:2px solid #d33}";
+  h += ".panel.safety h2{color:#f44}";
+  h += ".form-row{margin-bottom:15px}";
+  h += ".form-row label{display:block;color:#888;margin-bottom:5px}";
+  h += ".form-row input{width:100%;padding:12px;background:#0f0f23;border:1px solid #333;border-radius:4px;color:#fff}";
+  h += ".form-row input:disabled{background:#1a1a1a;color:#666}";
+  h += ".form-row .hint{font-size:0.75em;color:#666;margin-top:3px}";
+  h += ".two-col{display:grid;grid-template-columns:1fr 1fr;gap:10px}";
+  h += "button{width:100%;padding:12px;border:none;border-radius:6px;font-weight:bold;cursor:pointer;margin-top:10px}";
+  h += ".btn-save{background:#0a4;color:#fff}.btn-back{background:#666;color:#fff}";
+  h += ".btn-unlock{background:#c80;color:#fff}.btn-danger{background:#d33;color:#fff}";
+  h += ".limits-info{background:#0a0a15;padding:10px;border-radius:4px;margin-bottom:15px;font-size:0.85em}";
+  h += ".limits-info span{color:#0cf}";
+  h += ".locked{opacity:0.5;pointer-events:none}";
+  h += "</style></head><body>";
+  h += "<h1>Settings</h1>";
+
+  // Show current safety limits
+  h += "<div class='panel'><h2>Current Safety Limits</h2>";
+  h += "<div class='limits-info'>";
+  h += "Voltage: <span>" + String(safetyLimits.absMinVoltage,2) + "V - " + String(safetyLimits.absMaxVoltage,2) + "V</span><br>";
+  h += "Max Charge Current: <span>" + String(safetyLimits.absMaxChargeCurrent,1) + "A</span><br>";
+  h += "Max Discharge Current: <span>" + String(safetyLimits.absMaxDischargeCurrent,1) + "A</span><br>";
+  h += "Warning at: <span>>" + String(safetyLimits.warnHighCurrent,1) + "A</span>";
+  h += "</div></div>";
+
+  h += "<div class='panel'><h2>Voltage (within limits)</h2>";
+  h += "<div class='two-col'>";
+  h += "<div class='form-row'><label>Min V (discharge cutoff)</label><input type='number' id='minV' step='0.01' min='" + String(safetyLimits.absMinVoltage,2) + "' max='" + String(safetyLimits.absMaxVoltage,2) + "' value='" + String(config.minVoltage,2) + "'></div>";
+  h += "<div class='form-row'><label>Max V (charge target)</label><input type='number' id='maxV' step='0.01' min='" + String(safetyLimits.absMinVoltage,2) + "' max='" + String(safetyLimits.absMaxVoltage,2) + "' value='" + String(config.maxVoltage,2) + "'></div>";
+  h += "</div></div>";
+
+  h += "<div class='panel'><h2>Current (within limits)</h2>";
+  h += "<div class='two-col'>";
+  h += "<div class='form-row'><label>Charge A (max " + String(safetyLimits.absMaxChargeCurrent,1) + ")</label><input type='number' id='chgI' step='0.1' min='0.1' max='" + String(safetyLimits.absMaxChargeCurrent,1) + "' value='" + String(config.chargeCurrent,1) + "'></div>";
+  h += "<div class='form-row'><label>Discharge A (max " + String(safetyLimits.absMaxDischargeCurrent,1) + ")</label><input type='number' id='disI' step='0.1' min='0.1' max='" + String(safetyLimits.absMaxDischargeCurrent,1) + "' value='" + String(config.dischargeCurrent,1) + "'></div>";
+  h += "</div></div>";
+
+  h += "<div class='panel'><h2>Temperature Alarms</h2>";
+  h += "<div class='two-col'>";
+  h += "<div class='form-row'><label>DS18B20 Alarm (C)</label><input type='number' id='temp' value='" + String(config.tempAlarm,0) + "'></div>";
+  h += "<div class='form-row'><label>Thermal Camera Alarm (C)</label><input type='number' id='therm' value='" + String(config.thermalAlarm,0) + "'></div>";
+  h += "</div></div>";
+
+  h += "<div class='panel'><h2>Test Settings</h2>";
+  h += "<div class='two-col'>";
+  h += "<div class='form-row'><label>Cycles</label><input type='number' id='cyc' min='1' max='100' value='" + String(config.numCycles) + "'></div>";
+  h += "<div class='form-row'><label>Log Interval (s)</label><input type='number' id='log' min='1' max='300' value='" + String(config.logInterval) + "'></div>";
+  h += "</div></div>";
+
+  h += "<div class='panel'>";
+  h += "<button class='btn-save' onclick='save()'>SAVE SETTINGS</button>";
+  h += "<button class='btn-back' onclick='location.href=\"/\"'>BACK TO MAIN</button>";
+  h += "</div>";
+
+  // SAFETY LIMITS SECTION - Requires code to unlock
+  h += "<div class='panel safety'><h2>⚠️ SAFETY LIMITS (Protected)</h2>";
+  h += "<p style='color:#f88;margin-bottom:15px;font-size:0.85em'>Changing these limits can damage batteries or cause fire. Requires safety code.</p>";
+
+  h += "<div class='form-row'><label>Safety Code</label><input type='password' id='safetyCode' placeholder='Enter code to unlock'></div>";
+  h += "<button class='btn-unlock' onclick='unlockSafety()'>UNLOCK SAFETY SETTINGS</button>";
+
+  h += "<div id='safetyFields' class='locked'>";
+  h += "<div class='two-col' style='margin-top:15px'>";
+  h += "<div class='form-row'><label>Absolute Min Voltage</label><input type='number' id='absMinV' step='0.01' value='" + String(safetyLimits.absMinVoltage,2) + "'><div class='hint'>Hard floor - cannot go below</div></div>";
+  h += "<div class='form-row'><label>Absolute Max Voltage</label><input type='number' id='absMaxV' step='0.01' value='" + String(safetyLimits.absMaxVoltage,2) + "'><div class='hint'>Hard ceiling - cannot exceed</div></div>";
+  h += "</div>";
+  h += "<div class='two-col'>";
+  h += "<div class='form-row'><label>Max Charge Current (A)</label><input type='number' id='absMaxCI' step='0.1' value='" + String(safetyLimits.absMaxChargeCurrent,1) + "'></div>";
+  h += "<div class='form-row'><label>Max Discharge Current (A)</label><input type='number' id='absMaxDI' step='0.1' value='" + String(safetyLimits.absMaxDischargeCurrent,1) + "'></div>";
+  h += "</div>";
+  h += "<div class='two-col'>";
+  h += "<div class='form-row'><label>Warn High Current (A)</label><input type='number' id='warnHiI' step='0.1' value='" + String(safetyLimits.warnHighCurrent,1) + "'><div class='hint'>Show warning above this</div></div>";
+  h += "<div class='form-row'><label>Warn High Voltage (V)</label><input type='number' id='warnHiV' step='0.01' value='" + String(safetyLimits.warnHighVoltage,2) + "'></div>";
+  h += "</div>";
+  h += "<div class='form-row'><label>New Safety Code (min 4 chars)</label><input type='password' id='newCode' placeholder='Leave empty to keep current'></div>";
+  h += "<button class='btn-danger' onclick='saveSafety()'>SAVE SAFETY LIMITS</button>";
+  h += "</div></div>";
+
+  // Safety Log
+  h += "<div class='panel'><h2>Safety Log</h2>";
+  h += "<button onclick='viewLog()'>View Safety Log</button>";
+  h += "<pre id='logPre' style='margin-top:10px;font-size:0.75em;max-height:200px;overflow:auto;background:#0a0a15;padding:10px;display:none'></pre>";
+  h += "</div>";
+
+  h += "<script>";
+  h += "function $(i){return document.getElementById(i)}";
+
+  // Validate before save
+  h += "function save(){";
+  h += "var minV=parseFloat($('minV').value),maxV=parseFloat($('maxV').value);";
+  h += "var chgI=parseFloat($('chgI').value),disI=parseFloat($('disI').value);";
+  // Check within safety limits
+  h += "if(minV<" + String(safetyLimits.absMinVoltage,2) + "||maxV>" + String(safetyLimits.absMaxVoltage,2) + "){";
+  h += "alert('Voltage outside safety limits!');return;}";
+  h += "if(chgI>" + String(safetyLimits.absMaxChargeCurrent,1) + "||disI>" + String(safetyLimits.absMaxDischargeCurrent,1) + "){";
+  h += "alert('Current exceeds safety limits!');return;}";
+  h += "if(minV>=maxV){alert('Min voltage must be less than max!');return;}";
+  // Confirm if high values
+  h += "var warns=[];";
+  h += "if(chgI>" + String(safetyLimits.warnHighCurrent,1) + ")warns.push('High charge current: '+chgI+'A');";
+  h += "if(disI>" + String(safetyLimits.warnHighCurrent,1) + ")warns.push('High discharge current: '+disI+'A');";
+  h += "if(warns.length>0&&!confirm('WARNING:\\n'+warns.join('\\n')+'\\n\\nSave anyway?'))return;";
+  h += "var p='minV='+minV+'&maxV='+maxV+'&chgI='+chgI+'&disI='+disI+'&cyc='+$('cyc').value+'&log='+$('log').value+'&temp='+$('temp').value+'&therm='+$('therm').value;";
+  h += "fetch('/save?'+p).then(r=>r.json()).then(d=>{if(d.ok)location.href='/';else alert('Error: '+d.error);}).catch(e=>alert('Error: '+e));}";
+
+  // Unlock safety section
+  h += "function unlockSafety(){";
+  h += "var code=$('safetyCode').value;";
+  h += "if(code.length<4){alert('Enter safety code');return;}";
+  h += "$('safetyFields').classList.remove('locked');}";
+
+  // Save safety limits
+  h += "function saveSafety(){";
+  h += "var code=$('safetyCode').value;";
+  h += "if(!confirm('⚠️ WARNING!\\n\\nYou are about to change SAFETY LIMITS.\\n\\nIncorrect values can:\\n- Destroy batteries\\n- Cause fires\\n- Damage equipment\\n\\nAre you absolutely sure?'))return;";
+  h += "var p='code='+encodeURIComponent(code);";
+  h += "p+='&absMinV='+$('absMinV').value;";
+  h += "p+='&absMaxV='+$('absMaxV').value;";
+  h += "p+='&absMaxCI='+$('absMaxCI').value;";
+  h += "p+='&absMaxDI='+$('absMaxDI').value;";
+  h += "p+='&warnHiI='+$('warnHiI').value;";
+  h += "p+='&warnHiV='+$('warnHiV').value;";
+  h += "if($('newCode').value.length>=4)p+='&newCode='+encodeURIComponent($('newCode').value);";
+  h += "fetch('/safety/update?'+p).then(r=>r.json()).then(d=>{";
+  h += "if(d.ok){alert('Safety limits updated!');location.reload();}";
+  h += "else alert('Error: '+d.error);}).catch(e=>alert('Error: '+e));}";
+
+  // View log
+  h += "function viewLog(){";
+  h += "fetch('/safety/log').then(r=>r.text()).then(t=>{";
+  h += "$('logPre').style.display='block';$('logPre').innerText=t;});}";
+
+  h += "</script></body></html>";
+
+  server.send(200, "text/html", h);
+}
+
+void handleStatus() {
+  String j = "{\"v\":" + String(status.voltage, 3);
+  j += ",\"i\":" + String(status.current, 2);
+  j += ",\"p\":" + String(status.power, 1);
+  j += ",\"t\":" + String(status.temperature, 1);
+  j += ",\"wh\":" + String(status.totalWh, 2);
+  j += ",\"ahc\":" + String(status.totalAhCharge, 4);
+  j += ",\"ahd\":" + String(status.totalAhDischarge, 4);
+  j += ",\"run\":" + String(status.running ? "true" : "false");
+  j += ",\"mode\":" + String(status.mode);
+  j += ",\"cyc\":" + String(status.currentCycle);
+  j += ",\"ncyc\":" + String(config.numCycles);
+  j += ",\"delta\":" + String(status.deltaConnected ? "true" : "false");
+  // Delta extended info
+  j += ",\"setV\":" + String(status.setVoltage, 2);
+  j += ",\"setI\":" + String(status.setCurrent, 2);
+  j += ",\"setINeg\":" + String(status.setCurrentNeg, 2);
+  j += ",\"cvMode\":" + String(status.cvMode ? "true" : "false");
+  j += ",\"cableLoss\":" + String(status.cableLoss, 3);
+  // Thermal
+  j += ",\"mlx\":" + String(mlxConnected ? "true" : "false");
+  j += ",\"mlxMin\":" + String(mlxMin, 1);
+  j += ",\"mlxMax\":" + String(mlxMax, 1);
+  j += ",\"mlxAvg\":" + String(mlxAvg, 1);
+  j += ",\"err\":\"" + status.lastError + "\"}";
+  server.send(200, "application/json", j);
+}
+
+void handleThermalData() {
+  if (!mlxConnected) {
+    server.send(200, "application/json", "{\"error\":\"MLX90640 not connected\"}");
+    return;
+  }
+
+  String j = "{\"data\":true,\"min\":" + String(mlxMin, 1);
+  j += ",\"max\":" + String(mlxMax, 1);
+  j += ",\"avg\":" + String(mlxAvg, 1);
+  j += ",\"colors\":[";
+
+  for (int i = 0; i < MLX_PIXELS; i++) {
+    if (i > 0) j += ",";
+    j += "\"" + getThermalColor(mlxFrame[i], mlxMin, mlxMax) + "\"";
+  }
+  j += "]}";
+
+  server.send(200, "application/json", j);
+}
+
+void handlePing() {
+  String r = deltaPing();
+  server.send(200, "application/json", "{\"result\":\"" + r + "\"}");
+}
+
+void handleCharge() {
+  float v = server.hasArg("v") ? server.arg("v").toFloat() : config.maxVoltage;
+  float i = server.hasArg("i") ? server.arg("i").toFloat() : config.chargeCurrent;
+
+  // Validate parameters
+  String error = validateChargeParams(v, i);
+  if (error.length() > 0) {
+    logSafetyEvent("CHARGE BLOCKED: " + error + " (V=" + String(v,2) + " I=" + String(i,1) + ")");
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + error + "\"}");
+    beepFail();
+    return;
+  }
+
+  logSafetyEvent("CHARGE STARTED: V=" + String(v,2) + " I=" + String(i,1));
+  startCharge(v, i);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleDischarge() {
+  float v = server.hasArg("v") ? server.arg("v").toFloat() : config.minVoltage;
+  float i = server.hasArg("i") ? server.arg("i").toFloat() : config.dischargeCurrent;
+
+  // Validate parameters
+  String error = validateDischargeParams(v, i);
+  if (error.length() > 0) {
+    logSafetyEvent("DISCHARGE BLOCKED: " + error + " (V=" + String(v,2) + " I=" + String(i,1) + ")");
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + error + "\"}");
+    beepFail();
+    return;
+  }
+
+  logSafetyEvent("DISCHARGE STARTED: V=" + String(v,2) + " I=" + String(i,1));
+  startDischarge(v, i);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleCycle() {
+  // Validate cycle parameters (uses config values)
+  String error = validateChargeParams(config.maxVoltage, config.chargeCurrent);
+  if (error.length() > 0) {
+    logSafetyEvent("CYCLE BLOCKED (charge params): " + error);
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + error + "\"}");
+    beepFail();
+    return;
+  }
+  error = validateDischargeParams(config.minVoltage, config.dischargeCurrent);
+  if (error.length() > 0) {
+    logSafetyEvent("CYCLE BLOCKED (discharge params): " + error);
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + error + "\"}");
+    beepFail();
+    return;
+  }
+
+  logSafetyEvent("CYCLE STARTED: " + String(config.minVoltage,2) + "-" + String(config.maxVoltage,2) + "V");
+  startCycle();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleStop() {
+  stopRequested = true;
+  status.running = false;
+  deltaStop();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleSave() {
+  String changes = "";
+
+  // Validate and apply settings with safety checks
+  if (server.hasArg("minV")) {
+    float newV = server.arg("minV").toFloat();
+    if (newV < safetyLimits.absMinVoltage || newV > safetyLimits.absMaxVoltage) {
+      server.send(400, "application/json",
+        "{\"ok\":false,\"error\":\"Min voltage outside safety limits\"}");
+      return;
+    }
+    if (newV != config.minVoltage) {
+      changes += "minV:" + String(config.minVoltage,2) + "->" + String(newV,2) + " ";
+      config.minVoltage = newV;
+    }
+  }
+
+  if (server.hasArg("maxV")) {
+    float newV = server.arg("maxV").toFloat();
+    if (newV < safetyLimits.absMinVoltage || newV > safetyLimits.absMaxVoltage) {
+      server.send(400, "application/json",
+        "{\"ok\":false,\"error\":\"Max voltage outside safety limits\"}");
+      return;
+    }
+    if (newV != config.maxVoltage) {
+      changes += "maxV:" + String(config.maxVoltage,2) + "->" + String(newV,2) + " ";
+      config.maxVoltage = newV;
+    }
+  }
+
+  if (server.hasArg("chgI")) {
+    float newI = server.arg("chgI").toFloat();
+    if (newI > safetyLimits.absMaxChargeCurrent) {
+      server.send(400, "application/json",
+        "{\"ok\":false,\"error\":\"Charge current exceeds safety limit of " +
+        String(safetyLimits.absMaxChargeCurrent,1) + "A\"}");
+      return;
+    }
+    if (newI != config.chargeCurrent) {
+      changes += "chgI:" + String(config.chargeCurrent,1) + "->" + String(newI,1) + " ";
+      config.chargeCurrent = newI;
+    }
+  }
+
+  if (server.hasArg("disI")) {
+    float newI = server.arg("disI").toFloat();
+    if (newI > safetyLimits.absMaxDischargeCurrent) {
+      server.send(400, "application/json",
+        "{\"ok\":false,\"error\":\"Discharge current exceeds safety limit of " +
+        String(safetyLimits.absMaxDischargeCurrent,1) + "A\"}");
+      return;
+    }
+    if (newI != config.dischargeCurrent) {
+      changes += "disI:" + String(config.dischargeCurrent,1) + "->" + String(newI,1) + " ";
+      config.dischargeCurrent = newI;
+    }
+  }
+
+  if (server.hasArg("cyc")) {
+    int newCyc = server.arg("cyc").toInt();
+    if (newCyc != config.numCycles) {
+      changes += "cyc:" + String(config.numCycles) + "->" + String(newCyc) + " ";
+      config.numCycles = newCyc;
+    }
+  }
+
+  if (server.hasArg("log")) {
+    int newLog = server.arg("log").toInt();
+    if (newLog != config.logInterval) {
+      changes += "log:" + String(config.logInterval) + "->" + String(newLog) + " ";
+      config.logInterval = newLog;
+    }
+  }
+
+  if (server.hasArg("temp")) {
+    float newT = server.arg("temp").toFloat();
+    if (newT != config.tempAlarm) {
+      changes += "temp:" + String(config.tempAlarm,0) + "->" + String(newT,0) + " ";
+      config.tempAlarm = newT;
+    }
+  }
+
+  if (server.hasArg("therm")) {
+    float newT = server.arg("therm").toFloat();
+    if (newT != config.thermalAlarm) {
+      changes += "therm:" + String(config.thermalAlarm,0) + "->" + String(newT,0) + " ";
+      config.thermalAlarm = newT;
+    }
+  }
+
+  if (changes.length() > 0) {
+    logSafetyEvent("CONFIG CHANGED: " + changes);
+  }
+
+  saveConfig();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// Get safety limits for frontend
+void handleGetSafetyLimits() {
+  String j = "{";
+  j += "\"absMinV\":" + String(safetyLimits.absMinVoltage, 2);
+  j += ",\"absMaxV\":" + String(safetyLimits.absMaxVoltage, 2);
+  j += ",\"absMaxCI\":" + String(safetyLimits.absMaxChargeCurrent, 1);
+  j += ",\"absMaxDI\":" + String(safetyLimits.absMaxDischargeCurrent, 1);
+  j += ",\"warnHiI\":" + String(safetyLimits.warnHighCurrent, 1);
+  j += ",\"warnHiV\":" + String(safetyLimits.warnHighVoltage, 2);
+  j += ",\"warnLoV\":" + String(safetyLimits.warnLowVoltage, 2);
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+// Verify safety code and update limits
+void handleUpdateSafetyLimits() {
+  // Verify safety code
+  if (!server.hasArg("code") || server.arg("code") != safetyLimits.safetyCode) {
+    logSafetyEvent("SAFETY LIMITS CHANGE DENIED - wrong code");
+    beepFail();
+    server.send(403, "application/json", "{\"ok\":false,\"error\":\"Invalid safety code\"}");
+    return;
+  }
+
+  String changes = "SAFETY LIMITS UPDATED: ";
+
+  if (server.hasArg("absMinV")) {
+    float v = server.arg("absMinV").toFloat();
+    changes += "absMinV:" + String(safetyLimits.absMinVoltage,2) + "->" + String(v,2) + " ";
+    safetyLimits.absMinVoltage = v;
+  }
+  if (server.hasArg("absMaxV")) {
+    float v = server.arg("absMaxV").toFloat();
+    changes += "absMaxV:" + String(safetyLimits.absMaxVoltage,2) + "->" + String(v,2) + " ";
+    safetyLimits.absMaxVoltage = v;
+  }
+  if (server.hasArg("absMaxCI")) {
+    float i = server.arg("absMaxCI").toFloat();
+    changes += "absMaxCI:" + String(safetyLimits.absMaxChargeCurrent,1) + "->" + String(i,1) + " ";
+    safetyLimits.absMaxChargeCurrent = i;
+  }
+  if (server.hasArg("absMaxDI")) {
+    float i = server.arg("absMaxDI").toFloat();
+    changes += "absMaxDI:" + String(safetyLimits.absMaxDischargeCurrent,1) + "->" + String(i,1) + " ";
+    safetyLimits.absMaxDischargeCurrent = i;
+  }
+  if (server.hasArg("warnHiI")) {
+    float i = server.arg("warnHiI").toFloat();
+    safetyLimits.warnHighCurrent = i;
+  }
+  if (server.hasArg("warnHiV")) {
+    float v = server.arg("warnHiV").toFloat();
+    safetyLimits.warnHighVoltage = v;
+  }
+  if (server.hasArg("warnLoV")) {
+    float v = server.arg("warnLoV").toFloat();
+    safetyLimits.warnLowVoltage = v;
+  }
+  if (server.hasArg("newCode") && server.arg("newCode").length() >= 4) {
+    changes += "CODE CHANGED ";
+    safetyLimits.safetyCode = server.arg("newCode");
+  }
+
+  logSafetyEvent(changes);
+  saveSafetyLimits();
+  beepOK();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// Get safety log
+void handleGetSafetyLog() {
+  if (!spiffsReady) {
+    server.send(503, "text/plain", "Storage not available");
+    return;
+  }
+  File f = SPIFFS.open(SAFETY_LOG_FILE, FILE_READ);
+  if (!f) {
+    server.send(200, "text/plain", "No safety log entries");
+    return;
+  }
+  server.streamFile(f, "text/plain");
+  f.close();
+}
+
+void handleDownloadCSV() {
+  if (!spiffsReady) {
+    server.send(503, "text/plain", "Storage not available");
+    return;
+  }
+  File f = SPIFFS.open(LOG_FILE, FILE_READ);
+  if (!f) {
+    server.send(404, "text/plain", "No log file found");
+    return;
+  }
+  server.sendHeader("Content-Disposition", "attachment; filename=battery_log.csv");
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+void handleDeleteLog() {
+  deleteLog();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleLogInfo() {
+  if (!spiffsReady) {
+    server.send(200, "application/json", "{\"logSize\":0,\"freeSpace\":0,\"logging\":false,\"error\":\"Storage unavailable\"}");
+    return;
+  }
+  size_t logSize = getLogSize();
+  size_t freeSpace = SPIFFS.totalBytes() - SPIFFS.usedBytes();
+  String j = "{\"logSize\":" + String(logSize);
+  j += ",\"freeSpace\":" + String(freeSpace);
+  j += ",\"logging\":" + String(loggingEnabled ? "true" : "false") + "}";
+  server.send(200, "application/json", j);
+}
+
+// ============== SETUP ==============
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n========== Battery Tester v7.0 + Thermal ==========\n");
+
+  initSPIFFS();
+  loadConfig();
+  loadSafetyLimits();
+
+  pinMode(PA_ENABLE_PIN, OUTPUT);
+  digitalWrite(PA_ENABLE_PIN, HIGH);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);  // 400kHz for MLX90640
+
+  es8311_init();
+  i2s_init();
+
+  // Initialize MLX90640
+  mlxConnected = mlxInit();
+  if (mlxConnected) {
+    Serial.println("[MLX] Thermal camera ready!");
+  } else {
+    Serial.println("[MLX] Not found - continuing without thermal");
+  }
+
+  tempSensor.begin();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.printf("\n[WIFI] %s\n", WiFi.localIP().toString().c_str());
+
+  server.on("/", sendMainPage);
+  server.on("/settings", sendSettingsPage);
+  server.on("/thermal", sendThermalPage);
+  server.on("/status", handleStatus);
+  server.on("/thermaldata", handleThermalData);
+  server.on("/ping", handlePing);
+  server.on("/charge", handleCharge);
+  server.on("/discharge", handleDischarge);
+  server.on("/cycle", handleCycle);
+  server.on("/stop", handleStop);
+  server.on("/save", handleSave);
+  server.on("/download", handleDownloadCSV);
+  server.on("/deletelog", handleDeleteLog);
+  server.on("/loginfo", handleLogInfo);
+  server.on("/safety", handleGetSafetyLimits);
+  server.on("/safety/update", handleUpdateSafetyLimits);
+  server.on("/safety/log", handleGetSafetyLog);
+  server.begin();
+
+  readTemp();
+  playTone(800, 100); playSilence(50); playTone(1000, 100); playSilence(50); playTone(1200, 150);
+
+  Serial.printf("\nReady: http://%s\n\n", WiFi.localIP().toString().c_str());
+}
+
+// ============== LOOP ==============
+void loop() {
+  server.handleClient();
+
+  // Read thermal camera
+  if (mlxConnected) {
+    mlxRead();
+  }
+
+  static unsigned long lastUpd = 0;
+  if (millis() - lastUpd >= 1000) {
+    lastUpd = millis();
+    if (status.running) updateTest();
+  }
+
+  static unsigned long lastTemp = 0;
+  if (millis() - lastTemp >= 5000) {
+    lastTemp = millis();
+    if (!status.running) readTemp();
+  }
+
+  delay(10);
+  yield();
+}
