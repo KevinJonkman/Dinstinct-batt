@@ -721,20 +721,23 @@ bool deltaReadMeasurements() {
   #define HARD_MIN_VOLTAGE 2.70
   #define HARD_MAX_VOLTAGE 4.15
 
-  if (v > 0.5 && v < HARD_MIN_VOLTAGE) {
-    // CRITICAL: Battery voltage too low! STOP IMMEDIATELY!
-    Serial.printf("\n!!! HARD SAFETY STOP: V=%.3fV < %.2fV !!!\n", v, HARD_MIN_VOLTAGE);
+  // LOW VOLTAGE CHECK TEMPORARILY DISABLED FOR BATTERY RECOVERY
+  // TODO: Re-enable after battery is recovered above 2.7V
+  /*
+  if (v > 0.5 && v < HARD_MIN_VOLTAGE && i < -0.5) {
+    Serial.printf("\n!!! HARD SAFETY STOP: V=%.3fV < %.2fV (discharging) !!!\n", v, HARD_MIN_VOLTAGE);
     deltaSet("OUTPut OFF");
     delay(100);
-    deltaSet("OUTPut OFF");  // Send twice to be sure
+    deltaSet("OUTPut OFF");
     stopRequested = true;
     status.running = false;
     status.mode = MODE_IDLE;
     status.lastError = "HARD STOP: Voltage below " + String(HARD_MIN_VOLTAGE, 2) + "V";
-    logSafetyEvent("HARD STOP: V=" + String(v, 3) + "V < min");
+    logSafetyEvent("HARD STOP: V=" + String(v, 3) + "V < min (discharge)");
     beepFail();
     return false;
   }
+  */
 
   if (v > HARD_MAX_VOLTAGE) {
     // CRITICAL: Battery voltage too high! STOP IMMEDIATELY!
@@ -1241,7 +1244,7 @@ void sendMainPage() {
   yield();  // Allow other tasks before building page
   String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
   h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  h += "<title>Battery Tester v7.0</title>";
+  h += "<title>Battery Tester v7.4</title>";
   h += "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>";
   h += "<link href='https://fonts.googleapis.com/css2?family=DSEG7+Classic:wght@400;700&display=swap' rel='stylesheet'>";
   h += "<style>";
@@ -1288,7 +1291,7 @@ void sendMainPage() {
   h += "@media(max-width:900px){.main-grid{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}.controls{grid-template-columns:1fr}.seg-display{flex-direction:column;align-items:center}}";
   h += "</style></head><body>";
 
-  h += "<h1>Battery Tester v7.0</h1>";
+  h += "<h1>Battery Tester v7.4</h1>";
   h += "<div class='st' id='st'>Loading...</div>";
   h += "<div class='err' id='err' style='display:none'></div>";
 
@@ -2805,7 +2808,7 @@ void updateWhTest() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n========== Battery Tester v7.0 + Thermal ==========\n");
+  Serial.println("\n========== Battery Tester v7.4 - HARD SAFETY LIMITS ==========\n");
 
   initSPIFFS();
   loadConfig();
