@@ -44,6 +44,7 @@ const int DELTA_PORT = 8462;
 
 #define ONE_WIRE_BUS 13
 #define PA_ENABLE_PIN   21
+#define BLUE_LED_PIN    22  // Blue LED on ESP32-LyraT
 #define I2C_SDA_PIN     18
 #define I2C_SCL_PIN     23
 #define ES8311_ADDR     0x18
@@ -62,6 +63,10 @@ DallasTemperature tempSensor(&oneWire);
 Preferences prefs;
 
 volatile bool stopRequested = false;
+
+// Blue LED status indicator
+unsigned long lastLedToggle = 0;
+bool ledState = false;
 
 // Forward declaration for quick stop
 void quickDeltaOff();
@@ -127,6 +132,7 @@ struct {
   unsigned long lastMeasureTime = 0;
   String lastError = "";
   bool deltaConnected = false;
+  unsigned long lastDeltaSuccess = 0;  // Last successful Delta communication
   int measureFailCount = 0;
   unsigned long lowCurrentStartTime = 0;
   bool lowCurrentActive = false;
@@ -136,7 +142,57 @@ struct {
   float setCurrentNeg = 0.0;   // Programmed current (negative/discharge)
   bool cvMode = false;         // true = Constant Voltage, false = Constant Current
   float cableLoss = 0.0;       // Voltage drop in cables
+  // Cycle tracking
+  unsigned long cycleStartTime = 0;  // Start time of current cycle phase
+  float cycleAhCharge = 0.0;         // Ah charged in current cycle
+  float cycleAhDischarge = 0.0;      // Ah discharged in current cycle
+  float peakTempThisCycle = 0.0;     // Peak temperature in current cycle
 } status;
+
+// Cycle history for tracking multiple cycles (SGS uses 100 cycles)
+#define MAX_CYCLE_HISTORY 100
+struct CycleData {
+  float ahCharge;
+  float ahDischarge;
+  float whCharge;
+  float whDischarge;
+  unsigned long chargeDurationMs;
+  unsigned long dischargeDurationMs;
+  float peakTemp;
+  float coulombEfficiency;  // Ah_discharge / Ah_charge * 100
+  float energyEfficiency;   // Wh_discharge / Wh_charge * 100
+  bool completed;
+};
+CycleData cycleHistory[MAX_CYCLE_HISTORY];
+int cycleHistoryCount = 0;
+
+// Anorgion Test Configuration - Professional battery testing parameters
+struct {
+  // Cell specifications (for energy density calculation)
+  float cellWeightKg = 0.312;      // Cell weight in kg (default from SGS: 312g)
+  float cellVolumeLiter = 0.120;   // Cell volume in liters (default from SGS: 120ml)
+  float nominalCapacity = 24.0;    // Nominal capacity in Ah
+  float nominalVoltage = 3.55;     // Nominal voltage
+
+  // SGS test parameters
+  float chargeVoltage = 4.15;      // Charge cutoff voltage (SGS: 4.15V)
+  float chargeCurrent = 24.0;      // Charge current (SGS: 24A = 1C)
+  float cutoffCurrent = 1.5;       // CV phase cutoff current (SGS: 1.5A = C/16)
+  float dischargeVoltage = 2.70;   // Discharge cutoff voltage (SGS: 2.7V)
+  float dischargeCurrent = 24.0;   // Discharge current (SGS: 24A = 1C)
+
+  int restTimeSeconds = 300;       // Rest between charge/discharge (SGS: 5 min)
+  int cycleRestSeconds = 300;      // Rest between full cycles (SGS: 5 min)
+  int totalCycles = 100;           // Total cycles to run (SGS: 100)
+  float maxTempStop = 45.0;        // Temperature stop condition (SGS: 45°C)
+
+  // Test state
+  bool sgsTestActive = false;
+  int sgsCurrentPhase = 0;         // 0=idle, 1=charging, 2=rest1, 3=discharging, 4=rest2
+  unsigned long phaseStartTime = 0;
+  float currentCycleWhCharge = 0;
+  float currentCycleWhDischarge = 0;
+} sgsConfig;
 
 // ============== MLX90640 THERMAL CAMERA ==============
 
@@ -501,6 +557,9 @@ String deltaQuery(String cmd) {
   }
 
   response.trim();
+  if (response.length() > 0) {
+    status.lastDeltaSuccess = millis();  // Mark successful communication
+  }
   return response;
 }
 
@@ -705,8 +764,22 @@ bool deltaReadMeasurements() {
     if (status.running && status.lastMeasureTime > 0) {
       float hours = (millis() - status.lastMeasureTime) / 3600000.0;
       status.totalWh += abs(p) * hours;
-      if (i > 0.01) status.totalAhCharge += i * hours;
-      else if (i < -0.01) status.totalAhDischarge += abs(i) * hours;
+      if (i > 0.01) {
+        status.totalAhCharge += i * hours;
+        status.cycleAhCharge += i * hours;  // Per-cycle tracking
+        sgsConfig.currentCycleWhCharge += abs(p) * hours;  // Wh tracking for efficiency
+      } else if (i < -0.01) {
+        status.totalAhDischarge += abs(i) * hours;
+        status.cycleAhDischarge += abs(i) * hours;  // Per-cycle tracking
+        sgsConfig.currentCycleWhDischarge += abs(p) * hours;  // Wh tracking for efficiency
+      }
+      // Track peak temperature this cycle
+      if (status.temperature > status.peakTempThisCycle) {
+        status.peakTempThisCycle = status.temperature;
+      }
+      if (mlxConnected && mlxMax > status.peakTempThisCycle) {
+        status.peakTempThisCycle = mlxMax;
+      }
     }
     status.lastMeasureTime = millis();
 
@@ -780,6 +853,65 @@ void resetStats() {
   status.lowCurrentStartTime = 0;
   status.lowCurrentActive = false;
   stopRequested = false;
+  // Reset cycle tracking
+  status.cycleStartTime = millis();
+  status.cycleAhCharge = 0;
+  status.cycleAhDischarge = 0;
+  status.peakTempThisCycle = 0;
+}
+
+void resetCycleHistory() {
+  cycleHistoryCount = 0;
+  for (int i = 0; i < MAX_CYCLE_HISTORY; i++) {
+    cycleHistory[i] = {0, 0, 0, 0, 0, false};
+  }
+}
+
+void saveCycleToHistory(bool isChargePhase) {
+  if (cycleHistoryCount >= MAX_CYCLE_HISTORY) return;
+
+  // For cycle mode, we save after discharge phase completes
+  // Each "cycle" = charge + discharge
+  if (!isChargePhase && status.currentCycle > 0) {
+    int idx = status.currentCycle - 1;
+    if (idx < MAX_CYCLE_HISTORY) {
+      cycleHistory[idx].ahCharge = status.cycleAhCharge;
+      cycleHistory[idx].ahDischarge = status.cycleAhDischarge;
+      cycleHistory[idx].whCharge = sgsConfig.currentCycleWhCharge;
+      cycleHistory[idx].whDischarge = sgsConfig.currentCycleWhDischarge;
+      cycleHistory[idx].dischargeDurationMs = millis() - status.cycleStartTime;
+      cycleHistory[idx].peakTemp = status.peakTempThisCycle;
+
+      // Calculate efficiencies
+      if (status.cycleAhCharge > 0.01) {
+        cycleHistory[idx].coulombEfficiency = (status.cycleAhDischarge / status.cycleAhCharge) * 100.0;
+      } else {
+        cycleHistory[idx].coulombEfficiency = 0;
+      }
+      if (sgsConfig.currentCycleWhCharge > 0.01) {
+        cycleHistory[idx].energyEfficiency = (sgsConfig.currentCycleWhDischarge / sgsConfig.currentCycleWhCharge) * 100.0;
+      } else {
+        cycleHistory[idx].energyEfficiency = 0;
+      }
+
+      cycleHistory[idx].completed = true;
+      cycleHistoryCount = max(cycleHistoryCount, status.currentCycle);
+
+      Serial.printf("[CYCLE] Saved cycle %d: %.3fAh/%.2fWh charge, %.3fAh/%.2fWh discharge, CE=%.1f%%, EE=%.1f%%\n",
+        status.currentCycle, status.cycleAhCharge, sgsConfig.currentCycleWhCharge,
+        status.cycleAhDischarge, sgsConfig.currentCycleWhDischarge,
+        cycleHistory[idx].coulombEfficiency, cycleHistory[idx].energyEfficiency);
+    }
+  }
+}
+
+void startNewCyclePhase() {
+  status.cycleStartTime = millis();
+  status.cycleAhCharge = 0;
+  status.cycleAhDischarge = 0;
+  status.peakTempThisCycle = 0;
+  sgsConfig.currentCycleWhCharge = 0;
+  sgsConfig.currentCycleWhDischarge = 0;
 }
 
 void startCharge(float voltage, float current) {
@@ -823,6 +955,7 @@ void startCycle() {
 
   Serial.printf("\n===== CYCLE %.2f-%.2fV =====\n", config.minVoltage, config.maxVoltage);
   resetStats();
+  resetCycleHistory();  // Clear previous cycle data
   startNewLog();
 
   if (!deltaSetupCharge(config.maxVoltage, config.chargeCurrent)) {
@@ -975,10 +1108,13 @@ void updateTest() {
               status.lowCurrentStartTime = millis();
               Serial.println("[CYCLE] Discharge low current, starting 2 min timer");
             } else if (millis() - status.lowCurrentStartTime >= 120000) {
-              Serial.printf("[CYCLE %d] Empty (2 min low current): %.3f Ah\n", status.currentCycle, status.totalAhDischarge);
+              Serial.printf("[CYCLE %d] Empty (2 min low current): %.3f Ah\n", status.currentCycle, status.cycleAhDischarge);
               playTone(1000, 200);
               status.lowCurrentActive = false;
               status.lowCurrentStartTime = 0;
+
+              // Save this cycle to history
+              saveCycleToHistory(false);  // false = discharge phase complete
 
               if (status.currentCycle >= config.numCycles) {
                 beepDone();
@@ -986,6 +1122,8 @@ void updateTest() {
               } else {
                 status.currentCycle++;
                 status.totalAhDischarge = 0;
+                // Start fresh tracking for new cycle
+                startNewCyclePhase();
                 deltaStop();
                 delay(2000);
                 deltaSetupCharge(config.maxVoltage, config.chargeCurrent);
@@ -1035,7 +1173,26 @@ String getThermalColor(float temp, float minT, float maxT) {
   return String(hex);
 }
 
+// Helper function to send HTML page with chunked transfer
+// This prevents browser timeout by sending headers immediately
+void sendChunkedPage(const String& content) {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+
+  // Send in chunks of 2KB to avoid memory issues
+  const int chunkSize = 2048;
+  int pos = 0;
+  while (pos < content.length()) {
+    int len = min(chunkSize, (int)(content.length() - pos));
+    server.sendContent(content.substring(pos, pos + len));
+    pos += len;
+    yield();  // Allow other tasks between chunks
+  }
+  server.sendContent("");  // End chunked transfer
+}
+
 void sendMainPage() {
+  yield();  // Allow other tasks before building page
   String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
   h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   h += "<title>Battery Tester v7.0</title>";
@@ -1089,11 +1246,12 @@ void sendMainPage() {
   h += "<div class='st' id='st'>Loading...</div>";
   h += "<div class='err' id='err' style='display:none'></div>";
 
-  // Large 7-segment displays for Voltage and Current
+  // Large 7-segment displays for Voltage, Current, Temp and Elapsed Time
   h += "<div class='seg-display'>";
   h += "<div class='seg-box'><div class='seg-label'>Voltage</div><div class='seg-value voltage' id='vBig'>--.---<span class='seg-unit'>V</span></div></div>";
   h += "<div class='seg-box'><div class='seg-label'>Current</div><div class='seg-value current' id='iBig'>--.--<span class='seg-unit'>A</span></div></div>";
   h += "<div class='seg-box'><div class='seg-label'>Temperature</div><div class='seg-value' id='tBig'>--.-<span class='seg-unit'>°C</span></div></div>";
+  h += "<div class='seg-box' style='border-color:#c80'><div class='seg-label'>Elapsed Time</div><div class='seg-value' id='elapsed' style='color:#c80;text-shadow:0 0 10px #c80'>00:00:00</div></div>";
   h += "</div>";
 
   // Smaller status cards
@@ -1102,6 +1260,27 @@ void sendMainPage() {
   h += "<div class='card'><div class='l'>Ah Discharge</div><div class='v' id='ahd'>--</div></div>";
   h += "<div class='card'><div class='l'>Total Wh</div><div class='v' id='wh'>--</div></div>";
   h += "<div class='card'><div class='l'>Power</div><div class='v' id='pwr'>--</div></div>";
+  h += "</div>";
+
+  // Cycle Tracking Panel (visible during cycle mode)
+  h += "<div class='panel' id='cyclePanel' style='background:#1a1a2a;border:2px solid #808;display:none'>";
+  h += "<h2 style='color:#c8f'>Cycle Progress</h2>";
+  h += "<div style='display:grid;grid-template-columns:repeat(5,1fr);gap:10px;text-align:center;margin-bottom:15px'>";
+  h += "<div class='card' style='background:#0a0a1a'><div class='l'>Cycle</div><div class='v' id='cycleNum' style='font-size:1.8em;color:#c8f'>-/-</div></div>";
+  h += "<div class='card' style='background:#0a0a1a'><div class='l'>Phase</div><div class='v' id='cyclePhase' style='color:#0f0'>--</div></div>";
+  h += "<div class='card' style='background:#0a0a1a'><div class='l'>Cycle Time</div><div class='v' id='cycleTime'>--:--</div></div>";
+  h += "<div class='card' style='background:#0a0a1a'><div class='l'>Cycle Ah+</div><div class='v' id='cycAhc' style='color:#0f0'>--</div></div>";
+  h += "<div class='card' style='background:#0a0a1a'><div class='l'>Cycle Ah-</div><div class='v' id='cycAhd' style='color:#f44'>--</div></div>";
+  h += "</div>";
+  // Cycle History Table
+  h += "<div id='cycleHistoryDiv' style='display:none'>";
+  h += "<h3 style='color:#888;font-size:0.9em;margin-bottom:8px'>Completed Cycles</h3>";
+  h += "<table style='width:100%;border-collapse:collapse;font-size:0.85em'>";
+  h += "<thead><tr style='color:#888;border-bottom:1px solid #333'>";
+  h += "<th style='padding:5px'>Cycle</th><th>Ah Charge</th><th>Ah Discharge</th><th>Duration</th><th>Peak Temp</th>";
+  h += "</tr></thead>";
+  h += "<tbody id='cycleHistoryBody'></tbody>";
+  h += "</table></div>";
   h += "</div>";
 
   // Delta PSU Status Panel - CV/CC, Set vs Measured, Cable Loss
@@ -1193,6 +1372,8 @@ void sendMainPage() {
   h += "<button class='br stop-btn' style='flex:1;min-width:150px' onclick='stop()'>STOP</button>";
   h += "<button class='bb' onclick='ping()'>PING DELTA</button><span id='ds'>-</span>";
   h += "<button onclick='location.href=\"/settings\"'>Settings</button>";
+  h += "<button style='background:#f80;color:#fff' onclick='location.href=\"/sgs\"'>Anorgion Test</button>";
+  h += "<button style='background:#0a0;color:#fff' onclick='location.href=\"/whtest\"'>Wh Test (12A)</button>";
   h += "<button onclick='clearChart()'>Clear Graph</button>";
   h += "</div>";
 
@@ -1231,6 +1412,10 @@ void sendMainPage() {
   // Thermal canvas
   h += "var tCanvas=$('thermal'),tCtx=tCanvas.getContext('2d');";
 
+  // Helper function to format seconds as HH:MM:SS
+  h += "function fmtTime(s){var h=Math.floor(s/3600);var m=Math.floor((s%3600)/60);var sec=s%60;";
+  h += "return (h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(sec<10?'0':'')+sec;}";
+
   // Update function
   h += "function upd(){fetch('/status').then(r=>r.json()).then(d=>{";
   // 7-segment displays
@@ -1238,12 +1423,38 @@ void sendMainPage() {
   h += "var iEl=$('iBig');iEl.innerHTML=d.i.toFixed(2)+'<span class=\"seg-unit\">A</span>';";
   h += "iEl.className='seg-value current'+(d.i<0?' negative':'');";
   h += "$('tBig').innerHTML=d.t.toFixed(1)+'<span class=\"seg-unit\">°C</span>';";
+  // Elapsed time display
+  h += "$('elapsed').innerText=fmtTime(d.elapsed||0);";
   // Cards
   h += "$('ahc').innerText=d.ahc.toFixed(3);";
   h += "$('ahd').innerText=d.ahd.toFixed(3);";
   h += "$('wh').innerText=d.wh.toFixed(2);";
   h += "$('pwr').innerText=d.p.toFixed(1)+'W';";
   h += "$('cyc').innerText=d.cyc+'/'+d.ncyc;";
+  // Cycle panel - show only during cycle mode (mode 3)
+  h += "var cp=$('cyclePanel');";
+  h += "if(d.mode==3){cp.style.display='block';";
+  h += "$('cycleNum').innerText=d.cyc+'/'+d.ncyc;";
+  h += "var phase=d.i>=0?'CHARGING':'DISCHARGING';";
+  h += "$('cyclePhase').innerText=phase;";
+  h += "$('cyclePhase').style.color=d.i>=0?'#0f0':'#f44';";
+  h += "$('cycleTime').innerText=fmtTime(d.cycleElapsed||0);";
+  h += "$('cycAhc').innerText=(d.cycAhc||0).toFixed(3);";
+  h += "$('cycAhd').innerText=(d.cycAhd||0).toFixed(3);";
+  // Update cycle history table
+  h += "var hist=d.cycleHistory||[];";
+  h += "var histDiv=$('cycleHistoryDiv');";
+  h += "if(hist.length>0){histDiv.style.display='block';";
+  h += "var tb=$('cycleHistoryBody');tb.innerHTML='';";
+  h += "for(var i=0;i<hist.length;i++){var c=hist[i];";
+  h += "var row='<tr style=\"color:#aaa;border-bottom:1px solid #222\">';";
+  h += "row+='<td style=\"padding:5px;color:#c8f\">#'+c.n+'</td>';";
+  h += "row+='<td style=\"color:#0f0\">'+c.ahc.toFixed(3)+'</td>';";
+  h += "row+='<td style=\"color:#f44\">'+c.ahd.toFixed(3)+'</td>';";
+  h += "row+='<td>'+fmtTime(c.dur)+'</td>';";
+  h += "row+='<td>'+c.pt.toFixed(1)+'°C</td></tr>';";
+  h += "tb.innerHTML+=row;}}else{histDiv.style.display='none';}";
+  h += "}else{cp.style.display='none';}";
   h += "$('ds').innerText=d.delta?'Connected':'Offline';";
   h += "$('ds').style.color=d.delta?'#0f0':'#f44';";
   h += "var modes=['IDLE','CHARGING','DISCHARGING','CYCLING'];";
@@ -1370,10 +1581,11 @@ void sendMainPage() {
   h += "setInterval(upd,2000);setInterval(updThermal,1000);setInterval(updLog,5000);upd();updLog();setTimeout(updThermal,500);";
   h += "</script></body></html>";
 
-  server.send(200, "text/html", h);
+  sendChunkedPage(h);
 }
 
 void sendThermalPage() {
+  yield();  // Allow other tasks before building page
   String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
   h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   h += "<title>Thermal Camera</title><style>";
@@ -1405,10 +1617,11 @@ void sendThermalPage() {
   h += "setInterval(upd,500);upd();";
   h += "</script></body></html>";
 
-  server.send(200, "text/html", h);
+  sendChunkedPage(h);
 }
 
 void sendSettingsPage() {
+  yield();  // Allow other tasks before building page
   String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
   h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   h += "<title>Settings</title><style>";
@@ -1552,7 +1765,377 @@ void sendSettingsPage() {
 
   h += "</script></body></html>";
 
-  server.send(200, "text/html", h);
+  sendChunkedPage(h);
+}
+
+// ============== SGS TEST PAGE ==============
+void sendSGSPage() {
+  yield();  // Allow other tasks before building page
+  String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<title>Anorgion Test Mode</title>";
+  h += "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>";
+  h += "<style>";
+  h += "*{box-sizing:border-box;margin:0;padding:0}";
+  h += "body{font-family:sans-serif;background:#1a1a2e;color:#eee;padding:10px}";
+  h += "h1{text-align:center;color:#f80;margin-bottom:10px}";
+  h += "h2{color:#0cf;font-size:1em;margin-bottom:10px}";
+  h += ".panel{background:#16213e;border-radius:6px;padding:15px;margin-bottom:10px}";
+  h += ".panel.sgs{border:2px solid #f80}";
+  h += ".grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}";
+  h += ".grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}";
+  h += ".grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}";
+  h += ".form-row{margin-bottom:10px}";
+  h += ".form-row label{display:block;color:#888;font-size:0.8em;margin-bottom:3px}";
+  h += ".form-row input{width:100%;padding:8px;background:#0f0f23;border:1px solid #333;border-radius:4px;color:#fff}";
+  h += ".card{background:#0a0a15;border-radius:6px;padding:10px;text-align:center}";
+  h += ".card .l{font-size:0.7em;color:#888}.card .v{font-size:1.3em;font-weight:bold;color:#0cf}";
+  h += "button{padding:10px 15px;border:none;border-radius:6px;font-weight:bold;cursor:pointer;margin:3px}";
+  h += ".btn-start{background:#0a4;color:#fff;font-size:1.1em;width:100%}";
+  h += ".btn-stop{background:#d33;color:#fff}.btn-back{background:#555;color:#fff}";
+  h += "table{width:100%;border-collapse:collapse;font-size:0.8em;margin-top:10px}";
+  h += "th,td{padding:6px;text-align:center;border-bottom:1px solid #333}";
+  h += "th{background:#0a0a15;color:#0cf}";
+  h += ".status-box{padding:15px;border-radius:6px;text-align:center;font-size:1.2em;font-weight:bold;margin-bottom:10px}";
+  h += ".status-idle{background:#333;color:#888}";
+  h += ".status-run{background:#c80;color:#fff}";
+  h += ".status-done{background:#0a4;color:#fff}";
+  h += ".ref-val{color:#f80;font-size:0.9em}";
+  h += ".graph-container{height:250px;position:relative;margin-top:15px}";
+  h += ".eff-good{color:#0f0}.eff-warn{color:#f80}.eff-bad{color:#f44}";
+  h += "</style></head><body>";
+
+  h += "<h1>Anorgion Test Mode</h1>";
+  h += "<div style='text-align:center;margin-bottom:10px'>";
+  h += "<button class='btn-back' onclick='location.href=\"/\"'>← Back to Main</button></div>";
+
+  // Status box
+  h += "<div class='status-box status-idle' id='sgsStatus'>IDLE - Configure and Start Test</div>";
+
+  // Main grid
+  h += "<div class='grid2'>";
+
+  // Left column - Configuration
+  h += "<div>";
+
+  // Cell Specifications
+  h += "<div class='panel'><h2>📦 Cell Specifications</h2>";
+  h += "<div class='grid2'>";
+  h += "<div class='form-row'><label>Cell Weight (g)</label><input type='number' id='cellWeight' step='0.1' value='" + String(sgsConfig.cellWeightKg * 1000, 1) + "'></div>";
+  h += "<div class='form-row'><label>Cell Volume (ml)</label><input type='number' id='cellVolume' step='0.1' value='" + String(sgsConfig.cellVolumeLiter * 1000, 1) + "'></div>";
+  h += "<div class='form-row'><label>Nominal Capacity (Ah)</label><input type='number' id='nomCap' step='0.1' value='" + String(sgsConfig.nominalCapacity, 1) + "'></div>";
+  h += "<div class='form-row'><label>Nominal Voltage (V)</label><input type='number' id='nomVolt' step='0.01' value='" + String(sgsConfig.nominalVoltage, 2) + "'></div>";
+  h += "</div></div>";
+
+  // Anorgion Test Parameters
+  h += "<div class='panel sgs'><h2>⚡ Anorgion Test Parameters</h2>";
+  h += "<div class='grid2'>";
+  h += "<div class='form-row'><label>Charge Voltage (V)</label><input type='number' id='chgV' step='0.01' value='" + String(sgsConfig.chargeVoltage, 2) + "'><div class='ref-val'>SGS: 4.15V</div></div>";
+  h += "<div class='form-row'><label>Charge Current (A)</label><input type='number' id='chgI' step='0.1' value='" + String(sgsConfig.chargeCurrent, 1) + "'><div class='ref-val'>SGS: 24A (1C)</div></div>";
+  h += "<div class='form-row'><label>Cutoff Current (A)</label><input type='number' id='cutI' step='0.1' value='" + String(sgsConfig.cutoffCurrent, 1) + "'><div class='ref-val'>SGS: 1.5A (C/16)</div></div>";
+  h += "<div class='form-row'><label>Discharge Voltage (V)</label><input type='number' id='disV' step='0.01' value='" + String(sgsConfig.dischargeVoltage, 2) + "'><div class='ref-val'>SGS: 2.70V</div></div>";
+  h += "<div class='form-row'><label>Discharge Current (A)</label><input type='number' id='disI' step='0.1' value='" + String(sgsConfig.dischargeCurrent, 1) + "'><div class='ref-val'>SGS: 24A (1C)</div></div>";
+  h += "<div class='form-row'><label>Max Temp Stop (°C)</label><input type='number' id='maxT' value='" + String(sgsConfig.maxTempStop, 0) + "'><div class='ref-val'>SGS: 45°C</div></div>";
+  h += "<div class='form-row'><label>Rest Time (sec)</label><input type='number' id='restT' value='" + String(sgsConfig.restTimeSeconds) + "'><div class='ref-val'>SGS: 300s (5min)</div></div>";
+  h += "<div class='form-row'><label>Total Cycles</label><input type='number' id='numCyc' min='1' max='100' value='" + String(sgsConfig.totalCycles) + "'><div class='ref-val'>SGS: 100</div></div>";
+  h += "</div>";
+  h += "<button class='btn-start' id='startBtn' onclick='startSGS()'>▶ START SGS TEST</button>";
+  h += "<button class='btn-stop' onclick='stopSGS()' style='width:100%;margin-top:5px'>■ STOP TEST</button>";
+  h += "</div>";
+
+  h += "</div>"; // end left column
+
+  // Right column - Live data & results
+  h += "<div>";
+
+  // Live Measurements
+  h += "<div class='panel'><h2>📊 Live Measurements</h2>";
+  h += "<div class='grid4'>";
+  h += "<div class='card'><div class='l'>Voltage</div><div class='v' id='liveV'>--</div></div>";
+  h += "<div class='card'><div class='l'>Current</div><div class='v' id='liveI'>--</div></div>";
+  h += "<div class='card'><div class='l'>Temperature</div><div class='v' id='liveT'>--</div></div>";
+  h += "<div class='card'><div class='l'>Power</div><div class='v' id='liveP'>--</div></div>";
+  h += "</div>";
+  h += "<div class='grid4' style='margin-top:8px'>";
+  h += "<div class='card'><div class='l'>Cycle</div><div class='v' id='liveCyc' style='color:#f80'>-/-</div></div>";
+  h += "<div class='card'><div class='l'>Phase</div><div class='v' id='livePhase' style='font-size:1em'>--</div></div>";
+  h += "<div class='card'><div class='l'>Elapsed</div><div class='v' id='liveElapsed' style='font-size:1em'>--:--:--</div></div>";
+  h += "<div class='card'><div class='l'>CV/CC</div><div class='v' id='liveCVCC'>--</div></div>";
+  h += "</div></div>";
+
+  // Current Cycle Stats
+  h += "<div class='panel'><h2>🔄 Current Cycle</h2>";
+  h += "<div class='grid4'>";
+  h += "<div class='card'><div class='l'>Ah Charge</div><div class='v' id='cycAhC' style='color:#0f0'>--</div></div>";
+  h += "<div class='card'><div class='l'>Ah Discharge</div><div class='v' id='cycAhD' style='color:#f44'>--</div></div>";
+  h += "<div class='card'><div class='l'>Wh Charge</div><div class='v' id='cycWhC' style='color:#0f0'>--</div></div>";
+  h += "<div class='card'><div class='l'>Wh Discharge</div><div class='v' id='cycWhD' style='color:#f44'>--</div></div>";
+  h += "</div></div>";
+
+  // Calculated Values (Energy Density)
+  h += "<div class='panel'><h2>📐 Energy Density (Live)</h2>";
+  h += "<div class='grid4'>";
+  h += "<div class='card'><div class='l'>Wh/kg (Grav)</div><div class='v' id='whKg'>--</div></div>";
+  h += "<div class='card'><div class='l'>Wh/L (Vol)</div><div class='v' id='whL'>--</div></div>";
+  h += "<div class='card'><div class='l'>Coulomb Eff</div><div class='v' id='effC'>--</div></div>";
+  h += "<div class='card'><div class='l'>Energy Eff</div><div class='v' id='effE'>--</div></div>";
+  h += "</div>";
+  h += "<div style='font-size:0.8em;color:#888;margin-top:8px'>SGS Reference (Cycle 100): <span style='color:#f80'>267.96 Wh/kg | 697.46 Wh/L | CE: 100.02% | EE: 88.65%</span></div>";
+  h += "</div>";
+
+  h += "</div>"; // end right column
+  h += "</div>"; // end main grid
+
+  // Results Section
+  h += "<div class='panel'><h2>📋 Cycle Results</h2>";
+
+  // Graph
+  h += "<div class='graph-container'><canvas id='sgsChart'></canvas></div>";
+
+  // Results table
+  h += "<div style='max-height:300px;overflow-y:auto;margin-top:15px'>";
+  h += "<table id='resultsTable'>";
+  h += "<thead><tr><th>Cycle</th><th>Ah Chg</th><th>Ah Dis</th><th>Wh Chg</th><th>Wh Dis</th><th>CE %</th><th>EE %</th><th>Wh/kg</th><th>Wh/L</th><th>Peak T</th></tr></thead>";
+  h += "<tbody id='resultsBody'></tbody>";
+  h += "</table></div>";
+
+  // Summary stats
+  h += "<div class='grid3' style='margin-top:15px'>";
+  h += "<div class='card' style='background:#1a2a1a'><div class='l'>Avg Coulomb Efficiency</div><div class='v' id='avgCE'>--</div></div>";
+  h += "<div class='card' style='background:#1a2a1a'><div class='l'>Avg Energy Efficiency</div><div class='v' id='avgEE'>--</div></div>";
+  h += "<div class='card' style='background:#1a2a1a'><div class='l'>Capacity Retention</div><div class='v' id='capRet'>--</div></div>";
+  h += "</div>";
+  h += "</div>";
+
+  // JavaScript
+  h += "<script>";
+  h += "function $(i){return document.getElementById(i)}";
+  h += "function fmtTime(s){var h=Math.floor(s/3600);var m=Math.floor((s%3600)/60);var sec=s%60;return (h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(sec<10?'0':'')+sec;}";
+
+  // Chart setup
+  h += "var ctx=$('sgsChart').getContext('2d');";
+  h += "var sgsChart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[";
+  h += "{label:'Ah Discharge',data:[],borderColor:'#f44',backgroundColor:'rgba(255,68,68,0.1)',yAxisID:'y',tension:0.3},";
+  h += "{label:'Coulomb Eff %',data:[],borderColor:'#0f0',backgroundColor:'rgba(0,255,0,0.1)',yAxisID:'y1',tension:0.3},";
+  h += "{label:'Energy Eff %',data:[],borderColor:'#0cf',backgroundColor:'rgba(0,204,255,0.1)',yAxisID:'y1',tension:0.3}";
+  h += "]},options:{responsive:true,maintainAspectRatio:false,animation:{duration:0},";
+  h += "scales:{x:{grid:{color:'#333'}},y:{type:'linear',position:'left',title:{display:true,text:'Capacity (Ah)',color:'#f44'},grid:{color:'#333'},ticks:{color:'#f44'}},";
+  h += "y1:{type:'linear',position:'right',min:80,max:105,title:{display:true,text:'Efficiency %',color:'#0f0'},grid:{drawOnChartArea:false},ticks:{color:'#0f0'}}},";
+  h += "plugins:{legend:{labels:{color:'#fff'}}}}});";
+
+  // Start SGS test
+  h += "function startSGS(){";
+  h += "var cfg={weight:parseFloat($('cellWeight').value)/1000,volume:parseFloat($('cellVolume').value)/1000,";
+  h += "nomCap:parseFloat($('nomCap').value),nomVolt:parseFloat($('nomVolt').value),";
+  h += "chgV:parseFloat($('chgV').value),chgI:parseFloat($('chgI').value),cutI:parseFloat($('cutI').value),";
+  h += "disV:parseFloat($('disV').value),disI:parseFloat($('disI').value),maxT:parseFloat($('maxT').value),";
+  h += "restT:parseInt($('restT').value),numCyc:parseInt($('numCyc').value)};";
+  h += "if(!confirm('Start Anorgion Test?\\n\\nCycles: '+cfg.numCyc+'\\nCharge: '+cfg.chgV+'V / '+cfg.chgI+'A\\nDischarge: '+cfg.disV+'V / '+cfg.disI+'A\\nCutoff: '+cfg.cutI+'A'))return;";
+  h += "var p=Object.keys(cfg).map(k=>k+'='+cfg[k]).join('&');";
+  h += "fetch('/sgs/start?'+p).then(r=>r.json()).then(d=>{";
+  h += "if(d.ok){$('sgsStatus').innerText='STARTING...';$('sgsStatus').className='status-box status-run';}";
+  h += "else alert('Error: '+d.error);}).catch(e=>alert('Error: '+e));}";
+
+  // Stop SGS test
+  h += "function stopSGS(){if(confirm('Stop Anorgion Test?')){fetch('/sgs/stop').then(()=>{";
+  h += "$('sgsStatus').innerText='STOPPED';$('sgsStatus').className='status-box status-idle';});}}";
+
+  // Update function
+  h += "function upd(){fetch('/sgs/status').then(r=>r.json()).then(d=>{";
+  // Live measurements
+  h += "$('liveV').innerText=d.v.toFixed(3)+'V';";
+  h += "$('liveI').innerText=d.i.toFixed(2)+'A';";
+  h += "$('liveI').style.color=d.i>=0?'#0f0':'#f44';";
+  h += "$('liveT').innerText=d.t.toFixed(1)+'°C';";
+  h += "$('liveP').innerText=d.p.toFixed(1)+'W';";
+  h += "$('liveCyc').innerText=d.cyc+'/'+d.ncyc;";
+  h += "$('liveElapsed').innerText=fmtTime(d.elapsed);";
+  h += "$('liveCVCC').innerText=d.cvMode?'CV':'CC';";
+  h += "$('liveCVCC').style.color=d.cvMode?'#0cf':'#f80';";
+
+  // Phase
+  h += "var phases=['IDLE','CHARGING','REST','DISCHARGING','REST'];";
+  h += "$('livePhase').innerText=phases[d.phase]||'--';";
+  h += "var phaseColors=['#888','#0f0','#888','#f44','#888'];";
+  h += "$('livePhase').style.color=phaseColors[d.phase]||'#888';";
+
+  // Status box
+  h += "if(d.active){$('sgsStatus').innerText='RUNNING - Cycle '+d.cyc+'/'+d.ncyc+' - '+phases[d.phase];$('sgsStatus').className='status-box status-run';}";
+  h += "else if(d.cyc>=d.ncyc&&d.cyc>0){$('sgsStatus').innerText='COMPLETE - '+d.cyc+' cycles finished';$('sgsStatus').className='status-box status-done';}";
+  h += "else{$('sgsStatus').innerText='IDLE - Configure and Start Test';$('sgsStatus').className='status-box status-idle';}";
+
+  // Current cycle data
+  h += "$('cycAhC').innerText=d.cycAhC.toFixed(3);";
+  h += "$('cycAhD').innerText=d.cycAhD.toFixed(3);";
+  h += "$('cycWhC').innerText=d.cycWhC.toFixed(2);";
+  h += "$('cycWhD').innerText=d.cycWhD.toFixed(2);";
+
+  // Energy density calculations
+  h += "if(d.cycWhD>0.1&&d.weight>0){var whkg=d.cycWhD/d.weight;$('whKg').innerText=whkg.toFixed(1);}else{$('whKg').innerText='--';}";
+  h += "if(d.cycWhD>0.1&&d.volume>0){var whl=d.cycWhD/d.volume;$('whL').innerText=whl.toFixed(1);}else{$('whL').innerText='--';}";
+
+  // Efficiency (current cycle)
+  h += "if(d.cycAhC>0.1){var ce=(d.cycAhD/d.cycAhC)*100;$('effC').innerText=ce.toFixed(1)+'%';$('effC').className='v '+(ce>99?'eff-good':ce>95?'eff-warn':'eff-bad');}else{$('effC').innerText='--';}";
+  h += "if(d.cycWhC>0.1){var ee=(d.cycWhD/d.cycWhC)*100;$('effE').innerText=ee.toFixed(1)+'%';$('effE').className='v '+(ee>85?'eff-good':ee>80?'eff-warn':'eff-bad');}else{$('effE').innerText='--';}";
+
+  // Update results table and chart
+  h += "var hist=d.history||[];";
+  h += "if(hist.length>0){";
+  h += "var tb=$('resultsBody');tb.innerHTML='';";
+  h += "var labels=[],ahData=[],ceData=[],eeData=[];";
+  h += "var sumCE=0,sumEE=0,firstAh=0,lastAh=0;";
+  h += "for(var i=0;i<hist.length;i++){var c=hist[i];";
+  h += "if(i==0)firstAh=c.ahd;lastAh=c.ahd;";
+  h += "sumCE+=c.ce;sumEE+=c.ee;";
+  h += "var whkg=(c.whd/d.weight).toFixed(1);var whl=(c.whd/d.volume).toFixed(1);";
+  h += "var row='<tr><td style=\"color:#f80\">#'+(i+1)+'</td>';";
+  h += "row+='<td style=\"color:#0f0\">'+c.ahc.toFixed(3)+'</td>';";
+  h += "row+='<td style=\"color:#f44\">'+c.ahd.toFixed(3)+'</td>';";
+  h += "row+='<td>'+c.whc.toFixed(2)+'</td>';";
+  h += "row+='<td>'+c.whd.toFixed(2)+'</td>';";
+  h += "row+='<td class=\"'+(c.ce>99?'eff-good':c.ce>95?'eff-warn':'eff-bad')+'\">'+c.ce.toFixed(1)+'</td>';";
+  h += "row+='<td class=\"'+(c.ee>85?'eff-good':c.ee>80?'eff-warn':'eff-bad')+'\">'+c.ee.toFixed(1)+'</td>';";
+  h += "row+='<td>'+whkg+'</td>';";
+  h += "row+='<td>'+whl+'</td>';";
+  h += "row+='<td>'+c.pt.toFixed(1)+'°C</td></tr>';";
+  h += "tb.innerHTML+=row;";
+  h += "labels.push(''+(i+1));ahData.push(c.ahd);ceData.push(c.ce);eeData.push(c.ee);}";
+
+  // Update chart
+  h += "sgsChart.data.labels=labels;";
+  h += "sgsChart.data.datasets[0].data=ahData;";
+  h += "sgsChart.data.datasets[1].data=ceData;";
+  h += "sgsChart.data.datasets[2].data=eeData;";
+  h += "sgsChart.update();";
+
+  // Summary stats
+  h += "$('avgCE').innerText=(sumCE/hist.length).toFixed(2)+'%';";
+  h += "$('avgEE').innerText=(sumEE/hist.length).toFixed(2)+'%';";
+  h += "if(firstAh>0){$('capRet').innerText=((lastAh/firstAh)*100).toFixed(1)+'%';}";
+  h += "}";
+
+  h += "}).catch(()=>{})}";
+
+  h += "setInterval(upd,2000);upd();";
+  h += "</script></body></html>";
+
+  sendChunkedPage(h);
+}
+
+// SGS Status endpoint
+void handleSGSStatus() {
+  String j = "{\"v\":" + String(status.voltage, 3);
+  j += ",\"i\":" + String(status.current, 2);
+  j += ",\"p\":" + String(status.power, 1);
+  j += ",\"t\":" + String(status.temperature, 1);
+  j += ",\"cyc\":" + String(status.currentCycle);
+  j += ",\"ncyc\":" + String(sgsConfig.totalCycles);
+  j += ",\"active\":" + String(sgsConfig.sgsTestActive ? "true" : "false");
+  j += ",\"phase\":" + String(sgsConfig.sgsCurrentPhase);
+  j += ",\"cvMode\":" + String(status.cvMode ? "true" : "false");
+
+  unsigned long elapsed = status.running ? (millis() - status.startTime) / 1000 : 0;
+  j += ",\"elapsed\":" + String(elapsed);
+
+  // Current cycle data
+  j += ",\"cycAhC\":" + String(status.cycleAhCharge, 4);
+  j += ",\"cycAhD\":" + String(status.cycleAhDischarge, 4);
+  j += ",\"cycWhC\":" + String(sgsConfig.currentCycleWhCharge, 2);
+  j += ",\"cycWhD\":" + String(sgsConfig.currentCycleWhDischarge, 2);
+
+  // Cell specs for calculations
+  j += ",\"weight\":" + String(sgsConfig.cellWeightKg, 4);
+  j += ",\"volume\":" + String(sgsConfig.cellVolumeLiter, 4);
+
+  // Cycle history
+  j += ",\"history\":[";
+  for (int i = 0; i < cycleHistoryCount && i < MAX_CYCLE_HISTORY; i++) {
+    if (i > 0) j += ",";
+    j += "{\"ahc\":" + String(cycleHistory[i].ahCharge, 4);
+    j += ",\"ahd\":" + String(cycleHistory[i].ahDischarge, 4);
+    j += ",\"whc\":" + String(cycleHistory[i].whCharge, 2);
+    j += ",\"whd\":" + String(cycleHistory[i].whDischarge, 2);
+    j += ",\"ce\":" + String(cycleHistory[i].coulombEfficiency, 2);
+    j += ",\"ee\":" + String(cycleHistory[i].energyEfficiency, 2);
+    j += ",\"pt\":" + String(cycleHistory[i].peakTemp, 1) + "}";
+  }
+  j += "]}";
+
+  server.send(200, "application/json", j);
+}
+
+// SGS Start endpoint
+void handleSGSStart() {
+  if (status.running) {
+    server.send(200, "application/json", "{\"ok\":false,\"error\":\"Test already running\"}");
+    return;
+  }
+
+  // Parse parameters
+  if (server.hasArg("weight")) sgsConfig.cellWeightKg = server.arg("weight").toFloat();
+  if (server.hasArg("volume")) sgsConfig.cellVolumeLiter = server.arg("volume").toFloat();
+  if (server.hasArg("nomCap")) sgsConfig.nominalCapacity = server.arg("nomCap").toFloat();
+  if (server.hasArg("nomVolt")) sgsConfig.nominalVoltage = server.arg("nomVolt").toFloat();
+  if (server.hasArg("chgV")) sgsConfig.chargeVoltage = server.arg("chgV").toFloat();
+  if (server.hasArg("chgI")) sgsConfig.chargeCurrent = server.arg("chgI").toFloat();
+  if (server.hasArg("cutI")) sgsConfig.cutoffCurrent = server.arg("cutI").toFloat();
+  if (server.hasArg("disV")) sgsConfig.dischargeVoltage = server.arg("disV").toFloat();
+  if (server.hasArg("disI")) sgsConfig.dischargeCurrent = server.arg("disI").toFloat();
+  if (server.hasArg("maxT")) sgsConfig.maxTempStop = server.arg("maxT").toFloat();
+  if (server.hasArg("restT")) sgsConfig.restTimeSeconds = server.arg("restT").toInt();
+  if (server.hasArg("numCyc")) sgsConfig.totalCycles = server.arg("numCyc").toInt();
+
+  // Validate
+  String error = validateChargeParams(sgsConfig.chargeVoltage, sgsConfig.chargeCurrent);
+  if (error.length() > 0) {
+    server.send(200, "application/json", "{\"ok\":false,\"error\":\"" + error + "\"}");
+    return;
+  }
+
+  // Log
+  Serial.printf("\n===== SGS TEST START =====\n");
+  Serial.printf("Cell: %.1fg, %.1fml, %.1fAh nom\n",
+    sgsConfig.cellWeightKg * 1000, sgsConfig.cellVolumeLiter * 1000, sgsConfig.nominalCapacity);
+  Serial.printf("Charge: %.2fV, %.1fA, cutoff %.1fA\n",
+    sgsConfig.chargeVoltage, sgsConfig.chargeCurrent, sgsConfig.cutoffCurrent);
+  Serial.printf("Discharge: %.2fV, %.1fA\n",
+    sgsConfig.dischargeVoltage, sgsConfig.dischargeCurrent);
+  Serial.printf("Cycles: %d, Rest: %ds, MaxT: %.0f°C\n",
+    sgsConfig.totalCycles, sgsConfig.restTimeSeconds, sgsConfig.maxTempStop);
+
+  logSafetyEvent("Anorgion Test started: " + String(sgsConfig.totalCycles) + " cycles");
+
+  // Reset everything
+  resetStats();
+  resetCycleHistory();
+  startNewLog();
+
+  // Start first charge cycle
+  sgsConfig.sgsTestActive = true;
+  sgsConfig.sgsCurrentPhase = 1; // Charging
+  sgsConfig.phaseStartTime = millis();
+  status.currentCycle = 1;
+
+  // Configure Delta for charging
+  if (!deltaSetupCharge(sgsConfig.chargeVoltage, sgsConfig.chargeCurrent)) {
+    sgsConfig.sgsTestActive = false;
+    server.send(200, "application/json", "{\"ok\":false,\"error\":\"Delta connection failed\"}");
+    return;
+  }
+
+  beepStart();
+  status.mode = MODE_CYCLE;
+  status.running = true;
+
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// SGS Stop endpoint
+void handleSGSStop() {
+  sgsConfig.sgsTestActive = false;
+  sgsConfig.sgsCurrentPhase = 0;
+  stopTest();
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleStatus() {
@@ -1567,7 +2150,18 @@ void handleStatus() {
   j += ",\"mode\":" + String(status.mode);
   j += ",\"cyc\":" + String(status.currentCycle);
   j += ",\"ncyc\":" + String(config.numCycles);
-  j += ",\"delta\":" + String(status.deltaConnected ? "true" : "false");
+  // Delta status - consider "online" if we had success within last 10 seconds
+  bool deltaOk = (millis() - status.lastDeltaSuccess < 10000) || status.deltaConnected;
+  j += ",\"delta\":" + String(deltaOk ? "true" : "false");
+  // Elapsed time tracking
+  unsigned long elapsedSec = status.running ? (millis() - status.startTime) / 1000 : 0;
+  unsigned long cycleElapsedSec = status.running ? (millis() - status.cycleStartTime) / 1000 : 0;
+  j += ",\"elapsed\":" + String(elapsedSec);
+  j += ",\"cycleElapsed\":" + String(cycleElapsedSec);
+  // Current cycle Ah tracking
+  j += ",\"cycAhc\":" + String(status.cycleAhCharge, 4);
+  j += ",\"cycAhd\":" + String(status.cycleAhDischarge, 4);
+  j += ",\"peakT\":" + String(status.peakTempThisCycle, 1);
   // Delta extended info
   j += ",\"setV\":" + String(status.setVoltage, 2);
   j += ",\"setI\":" + String(status.setCurrent, 2);
@@ -1579,6 +2173,18 @@ void handleStatus() {
   j += ",\"mlxMin\":" + String(mlxMin, 1);
   j += ",\"mlxMax\":" + String(mlxMax, 1);
   j += ",\"mlxAvg\":" + String(mlxAvg, 1);
+  // Cycle history array
+  j += ",\"cycleHistory\":[";
+  for (int i = 0; i < cycleHistoryCount && i < MAX_CYCLE_HISTORY; i++) {
+    if (i > 0) j += ",";
+    j += "{\"n\":" + String(i + 1);
+    j += ",\"ahc\":" + String(cycleHistory[i].ahCharge, 3);
+    j += ",\"ahd\":" + String(cycleHistory[i].ahDischarge, 3);
+    j += ",\"dur\":" + String((cycleHistory[i].chargeDurationMs + cycleHistory[i].dischargeDurationMs) / 1000);
+    j += ",\"pt\":" + String(cycleHistory[i].peakTemp, 1);
+    j += ",\"done\":" + String(cycleHistory[i].completed ? "true" : "false") + "}";
+  }
+  j += "]";
   j += ",\"err\":\"" + status.lastError + "\"}";
   server.send(200, "application/json", j);
 }
@@ -1897,6 +2503,247 @@ void handleLogInfo() {
   server.send(200, "application/json", j);
 }
 
+// ============== Wh CAPACITY TEST ==============
+// Quick single-cycle test at 12A to determine Wh capacity
+
+void sendWhTestPage() {
+  yield();  // Allow other tasks
+  String h = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+  h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<title>Wh Capacity Test</title>";
+  h += "<style>";
+  h += "body{font:16px sans-serif;background:#1a1a2e;color:#eee;margin:0;padding:10px}";
+  h += ".panel{background:#16213e;border-radius:8px;padding:15px;margin:10px 0}";
+  h += "h1{color:#0cf;margin:0 0 15px 0;font-size:1.5em}";
+  h += "h2{color:#0f6;margin:0 0 10px 0;font-size:1.1em}";
+  h += ".row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #333}";
+  h += ".k{color:#888}.v{color:#fff;font-weight:bold}";
+  h += "input{background:#0d1b2a;border:1px solid #444;color:#fff;padding:8px;border-radius:4px;width:80px;text-align:center}";
+  h += "button{padding:12px 20px;border:none;border-radius:4px;cursor:pointer;font-weight:bold;margin:5px}";
+  h += ".bg{background:#0a0;color:#fff}.br{background:#f00;color:#fff}.bb{background:#06f;color:#fff}";
+  h += ".big{font-size:2.5em;color:#0f6;text-align:center;padding:20px}";
+  h += ".result{background:#0a3;padding:20px;border-radius:8px;margin:10px 0}";
+  h += "</style></head><body>";
+
+  h += "<h1>Wh Capacity Test</h1>";
+  h += "<a href='/' style='color:#0cf'>← Back to Dashboard</a>";
+
+  // Status panel
+  h += "<div class='panel'><h2>Current Status</h2>";
+  h += "<div class='row'><span class='k'>Voltage</span><span class='v' id='volt'>-</span></div>";
+  h += "<div class='row'><span class='k'>Current</span><span class='v' id='curr'>-</span></div>";
+  h += "<div class='row'><span class='k'>Power</span><span class='v' id='pwr'>-</span></div>";
+  h += "<div class='row'><span class='k'>Temperature</span><span class='v' id='temp'>-</span></div>";
+  h += "<div class='row'><span class='k'>Phase</span><span class='v' id='phase'>Idle</span></div>";
+  h += "</div>";
+
+  // Result panel
+  h += "<div class='panel result' id='resultPanel' style='display:none'>";
+  h += "<h2>Test Result</h2>";
+  h += "<div class='big' id='whResult'>0.00 Wh</div>";
+  h += "<div class='row'><span class='k'>Ah Charged</span><span class='v' id='ahChg'>-</span></div>";
+  h += "<div class='row'><span class='k'>Ah Discharged</span><span class='v' id='ahDis'>-</span></div>";
+  h += "<div class='row'><span class='k'>Wh Charged</span><span class='v' id='whChg'>-</span></div>";
+  h += "<div class='row'><span class='k'>Wh Discharged</span><span class='v' id='whDis'>-</span></div>";
+  h += "<div class='row'><span class='k'>Energy Efficiency</span><span class='v' id='eff'>-</span></div>";
+  h += "</div>";
+
+  // Test parameters
+  h += "<div class='panel'><h2>Test Parameters</h2>";
+  h += "<div class='row'><span class='k'>Charge Voltage</span><input type='number' id='chgV' value='4.15' step='0.01'> V</div>";
+  h += "<div class='row'><span class='k'>Charge Current</span><input type='number' id='chgI' value='12' step='0.1'> A</div>";
+  h += "<div class='row'><span class='k'>Cutoff Current</span><input type='number' id='cutI' value='1.5' step='0.1'> A</div>";
+  h += "<div class='row'><span class='k'>Discharge Voltage</span><input type='number' id='disV' value='2.70' step='0.01'> V</div>";
+  h += "<div class='row'><span class='k'>Discharge Current</span><input type='number' id='disI' value='12' step='0.1'> A</div>";
+  h += "</div>";
+
+  // Control buttons
+  h += "<div class='panel' style='text-align:center'>";
+  h += "<button class='bg' style='font-size:1.2em;padding:15px 40px' onclick='startTest()'>START Wh TEST</button>";
+  h += "<button class='br' style='font-size:1.2em;padding:15px 40px' onclick='stopTest()'>STOP</button>";
+  h += "</div>";
+
+  // JavaScript
+  h += "<script>";
+  h += "function startTest(){";
+  h += "var p='chgV='+$('chgV').value+'&chgI='+$('chgI').value+'&cutI='+$('cutI').value+'&disV='+$('disV').value+'&disI='+$('disI').value;";
+  h += "if(!confirm('Start Wh Capacity Test?\\n\\n1. Charge to '+$('chgV').value+'V at '+$('chgI').value+'A\\n2. Discharge to '+$('disV').value+'V at '+$('disI').value+'A'))return;";
+  h += "fetch('/whtest/start?'+p).then(r=>r.json()).then(d=>{if(d.ok)alert('Test started!');else alert('Error: '+d.msg);});}";
+  h += "function stopTest(){if(confirm('Stop test?')){fetch('/stop').then(()=>alert('Stopped'));}}";
+  h += "function $(i){return document.getElementById(i)}";
+  h += "function upd(){fetch('/whtest/status').then(r=>r.json()).then(d=>{";
+  h += "$('volt').innerText=d.v.toFixed(3)+'V';";
+  h += "$('curr').innerText=d.i.toFixed(2)+'A';";
+  h += "$('pwr').innerText=d.p.toFixed(1)+'W';";
+  h += "$('temp').innerText=d.t.toFixed(1)+'°C';";
+  h += "$('phase').innerText=d.phase;";
+  h += "if(d.done){";
+  h += "$('resultPanel').style.display='block';";
+  h += "$('whResult').innerText=d.whDis.toFixed(2)+' Wh';";
+  h += "$('ahChg').innerText=d.ahChg.toFixed(3)+' Ah';";
+  h += "$('ahDis').innerText=d.ahDis.toFixed(3)+' Ah';";
+  h += "$('whChg').innerText=d.whChg.toFixed(2)+' Wh';";
+  h += "$('whDis').innerText=d.whDis.toFixed(2)+' Wh';";
+  h += "var eff=d.whChg>0?(d.whDis/d.whChg*100):0;";
+  h += "$('eff').innerText=eff.toFixed(1)+'%';";
+  h += "}}).catch(e=>console.log(e));}";
+  h += "setInterval(upd,1000);upd();";
+  h += "</script></body></html>";
+
+  sendChunkedPage(h);
+}
+
+// Wh test state
+struct {
+  bool active = false;
+  int phase = 0;  // 0=idle, 1=charging, 2=discharging, 3=done
+  float chargeVoltage = 4.15;
+  float chargeCurrent = 12.0;
+  float cutoffCurrent = 1.5;
+  float dischargeVoltage = 2.70;
+  float dischargeCurrent = 12.0;
+  float ahCharge = 0;
+  float ahDischarge = 0;
+  float whCharge = 0;
+  float whDischarge = 0;
+  unsigned long phaseStartTime = 0;
+} whTest;
+
+void handleWhTestStatus() {
+  String phase = "Idle";
+  if (whTest.phase == 1) phase = "Charging";
+  else if (whTest.phase == 2) phase = "Discharging";
+  else if (whTest.phase == 3) phase = "Complete";
+
+  String j = "{\"v\":" + String(status.voltage, 3);
+  j += ",\"i\":" + String(status.current, 2);
+  j += ",\"p\":" + String(status.power, 1);
+  j += ",\"t\":" + String(status.temperature, 1);
+  j += ",\"phase\":\"" + phase + "\"";
+  j += ",\"done\":" + String(whTest.phase == 3 ? "true" : "false");
+  j += ",\"ahChg\":" + String(whTest.ahCharge, 3);
+  j += ",\"ahDis\":" + String(whTest.ahDischarge, 3);
+  j += ",\"whChg\":" + String(whTest.whCharge, 2);
+  j += ",\"whDis\":" + String(whTest.whDischarge, 2);
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+void handleWhTestStart() {
+  if (status.running) {
+    server.send(200, "application/json", "{\"ok\":false,\"msg\":\"Test already running\"}");
+    return;
+  }
+
+  whTest.chargeVoltage = server.hasArg("chgV") ? server.arg("chgV").toFloat() : 4.15;
+  whTest.chargeCurrent = server.hasArg("chgI") ? server.arg("chgI").toFloat() : 12.0;
+  whTest.cutoffCurrent = server.hasArg("cutI") ? server.arg("cutI").toFloat() : 1.5;
+  whTest.dischargeVoltage = server.hasArg("disV") ? server.arg("disV").toFloat() : 2.70;
+  whTest.dischargeCurrent = server.hasArg("disI") ? server.arg("disI").toFloat() : 12.0;
+
+  // Validate against safety limits
+  if (whTest.chargeVoltage > safetyLimits.absMaxVoltage || whTest.chargeVoltage < safetyLimits.absMinVoltage) {
+    server.send(200, "application/json", "{\"ok\":false,\"msg\":\"Charge voltage outside safety limits\"}");
+    return;
+  }
+  if (whTest.chargeCurrent > safetyLimits.absMaxChargeCurrent) {
+    server.send(200, "application/json", "{\"ok\":false,\"msg\":\"Charge current exceeds safety limit\"}");
+    return;
+  }
+
+  // Reset counters
+  whTest.ahCharge = 0;
+  whTest.ahDischarge = 0;
+  whTest.whCharge = 0;
+  whTest.whDischarge = 0;
+  whTest.phase = 1;
+  whTest.active = true;
+  whTest.phaseStartTime = millis();
+
+  // Reset status counters
+  status.totalAhCharge = 0;
+  status.totalAhDischarge = 0;
+  status.totalWh = 0;
+  status.cycleAhCharge = 0;
+  status.cycleAhDischarge = 0;
+  sgsConfig.currentCycleWhCharge = 0;
+  sgsConfig.currentCycleWhDischarge = 0;
+
+  // Start charging
+  if (!deltaSetupCharge(whTest.chargeVoltage, whTest.chargeCurrent)) {
+    whTest.active = false;
+    whTest.phase = 0;
+    server.send(200, "application/json", "{\"ok\":false,\"msg\":\"Delta connection failed\"}");
+    return;
+  }
+
+  status.running = true;
+  status.mode = MODE_CHARGE;
+  status.startTime = millis();
+  status.lastMeasureTime = millis();
+
+  logSafetyEvent("Wh Test started");
+  beepStart();
+
+  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Wh Test started\"}");
+}
+
+void updateWhTest() {
+  if (!whTest.active) return;
+
+  // Update energy counters from status
+  whTest.ahCharge = status.totalAhCharge;
+  whTest.ahDischarge = status.totalAhDischarge;
+  whTest.whCharge = sgsConfig.currentCycleWhCharge;
+  whTest.whDischarge = sgsConfig.currentCycleWhDischarge;
+
+  switch (whTest.phase) {
+    case 1: // Charging
+      if (status.voltage >= whTest.chargeVoltage - 0.02) {
+        // At voltage limit - check if current dropped below cutoff
+        if (abs(status.current) < whTest.cutoffCurrent) {
+          Serial.printf("[WhTest] Charge complete: %.3f Ah, %.2f Wh\n", whTest.ahCharge, whTest.whCharge);
+          playTone(1000, 150);
+
+          // Stop charging, start discharge
+          quickDeltaOff();
+          delay(1000);  // Brief pause
+
+          if (!deltaSetupDischarge(whTest.dischargeVoltage, whTest.dischargeCurrent)) {
+            status.lastError = "Delta connection failed during discharge setup";
+            whTest.active = false;
+            whTest.phase = 0;
+            return;
+          }
+
+          whTest.phase = 2;
+          whTest.phaseStartTime = millis();
+          status.mode = MODE_DISCHARGE;
+        }
+      }
+      break;
+
+    case 2: // Discharging
+      if (status.voltage <= whTest.dischargeVoltage + 0.02 && status.voltage > 0.5) {
+        if (abs(status.current) < 1.0) {
+          Serial.printf("[WhTest] Discharge complete: %.3f Ah, %.2f Wh\n", whTest.ahDischarge, whTest.whDischarge);
+          playTone(600, 200);
+
+          // Test complete
+          quickDeltaOff();
+          whTest.phase = 3;
+          whTest.active = false;
+          status.running = false;
+          status.mode = MODE_IDLE;
+
+          beepDone();
+          logSafetyEvent("Wh Test complete: " + String(whTest.whDischarge, 2) + " Wh");
+        }
+      }
+      break;
+  }
+}
+
 // ============== SETUP ==============
 void setup() {
   Serial.begin(115200);
@@ -1909,6 +2756,11 @@ void setup() {
 
   pinMode(PA_ENABLE_PIN, OUTPUT);
   digitalWrite(PA_ENABLE_PIN, HIGH);
+
+  // Blue LED for status indication
+  pinMode(BLUE_LED_PIN, OUTPUT);
+  digitalWrite(BLUE_LED_PIN, LOW);
+
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(400000);  // 400kHz for MLX90640
 
@@ -1937,6 +2789,13 @@ void setup() {
   server.on("/", sendMainPage);
   server.on("/settings", sendSettingsPage);
   server.on("/thermal", sendThermalPage);
+  server.on("/sgs", sendSGSPage);
+  server.on("/sgs/status", handleSGSStatus);
+  server.on("/sgs/start", handleSGSStart);
+  server.on("/sgs/stop", handleSGSStop);
+  server.on("/whtest", sendWhTestPage);
+  server.on("/whtest/status", handleWhTestStatus);
+  server.on("/whtest/start", handleWhTestStart);
   server.on("/status", handleStatus);
   server.on("/thermaldata", handleThermalData);
   server.on("/ping", handlePing);
@@ -1959,6 +2818,120 @@ void setup() {
   Serial.printf("\nReady: http://%s\n\n", WiFi.localIP().toString().c_str());
 }
 
+// ============== SGS TEST UPDATE ==============
+
+void updateSGSTest() {
+  if (!sgsConfig.sgsTestActive) return;
+
+  // Temperature safety check
+  if (status.temperature > sgsConfig.maxTempStop) {
+    Serial.printf("[SGS] Temperature %.1f°C exceeds limit %.1f°C - STOPPING\n",
+      status.temperature, sgsConfig.maxTempStop);
+    status.lastError = "TEMP ALARM: " + String(status.temperature, 1) + "°C";
+    sgsConfig.sgsTestActive = false;
+    stopTest();
+    beepFail();
+    return;
+  }
+
+  unsigned long phaseElapsed = (millis() - sgsConfig.phaseStartTime) / 1000;
+
+  switch (sgsConfig.sgsCurrentPhase) {
+    case 1: // CHARGING (CC/CV)
+      // Check if we reached CV phase and current dropped below cutoff
+      if (status.voltage >= sgsConfig.chargeVoltage - 0.02) {
+        // We're at voltage limit (CV mode)
+        if (abs(status.current) < sgsConfig.cutoffCurrent) {
+          Serial.printf("[SGS] Cycle %d: Charge complete (I=%.2fA < cutoff %.1fA)\n",
+            status.currentCycle, status.current, sgsConfig.cutoffCurrent);
+          playTone(1000, 150);
+
+          // Stop charging, start rest
+          quickDeltaOff();
+          sgsConfig.sgsCurrentPhase = 2; // Rest after charge
+          sgsConfig.phaseStartTime = millis();
+          Serial.printf("[SGS] Starting rest period (%d sec)\n", sgsConfig.restTimeSeconds);
+        }
+      }
+      break;
+
+    case 2: // REST after charge
+      if (phaseElapsed >= (unsigned long)sgsConfig.restTimeSeconds) {
+        Serial.printf("[SGS] Cycle %d: Rest complete, starting discharge\n", status.currentCycle);
+
+        // Start discharge
+        if (!deltaSetupDischarge(sgsConfig.dischargeVoltage, sgsConfig.dischargeCurrent)) {
+          status.lastError = "Delta connection failed during discharge setup";
+          sgsConfig.sgsTestActive = false;
+          stopTest();
+          beepFail();
+          return;
+        }
+
+        sgsConfig.sgsCurrentPhase = 3; // Discharging
+        sgsConfig.phaseStartTime = millis();
+        playTone(800, 150);
+      }
+      break;
+
+    case 3: // DISCHARGING (CC)
+      // Check if voltage dropped to cutoff
+      if (status.voltage <= sgsConfig.dischargeVoltage + 0.02 && status.voltage > 0.5) {
+        // Check if current is low (near end of discharge)
+        if (abs(status.current) < 2.0) {
+          Serial.printf("[SGS] Cycle %d: Discharge complete (V=%.3fV, I=%.2fA)\n",
+            status.currentCycle, status.voltage, status.current);
+          playTone(600, 150);
+
+          // Stop discharging, start rest
+          quickDeltaOff();
+          sgsConfig.sgsCurrentPhase = 4; // Rest after discharge
+          sgsConfig.phaseStartTime = millis();
+
+          // Save cycle data
+          saveCycleToHistory(false);
+
+          Serial.printf("[SGS] Starting rest period (%d sec)\n", sgsConfig.restTimeSeconds);
+        }
+      }
+      break;
+
+    case 4: // REST after discharge
+      if (phaseElapsed >= (unsigned long)sgsConfig.restTimeSeconds) {
+        // Check if we're done
+        if (status.currentCycle >= sgsConfig.totalCycles) {
+          Serial.printf("\n===== SGS TEST COMPLETE: %d cycles =====\n", status.currentCycle);
+          logSafetyEvent("Anorgion Test completed: " + String(status.currentCycle) + " cycles");
+          sgsConfig.sgsTestActive = false;
+          sgsConfig.sgsCurrentPhase = 0;
+          status.running = false;
+          status.mode = MODE_IDLE;
+          beepDone();
+          return;
+        }
+
+        // Start next cycle
+        status.currentCycle++;
+        startNewCyclePhase();
+        Serial.printf("[SGS] Starting cycle %d/%d\n", status.currentCycle, sgsConfig.totalCycles);
+
+        // Start charging
+        if (!deltaSetupCharge(sgsConfig.chargeVoltage, sgsConfig.chargeCurrent)) {
+          status.lastError = "Delta connection failed during charge setup";
+          sgsConfig.sgsTestActive = false;
+          stopTest();
+          beepFail();
+          return;
+        }
+
+        sgsConfig.sgsCurrentPhase = 1; // Charging
+        sgsConfig.phaseStartTime = millis();
+        playTone(1000, 100);
+      }
+      break;
+  }
+}
+
 // ============== LOOP ==============
 
 // Quick Delta off - minimal blocking
@@ -1978,6 +2951,15 @@ void loop() {
   server.handleClient();
   yield();
 
+  // Blue LED status indicator
+  // Fast blink (200ms) = running, slow blink (1000ms) = idle
+  unsigned long blinkInterval = status.running ? 200 : 1000;
+  if (millis() - lastLedToggle >= blinkInterval) {
+    lastLedToggle = millis();
+    ledState = !ledState;
+    digitalWrite(BLUE_LED_PIN, ledState ? HIGH : LOW);
+  }
+
   // Check for stop request - handle with minimal blocking
   static bool stopInProgress = false;
   if (stopRequested && !stopInProgress) {
@@ -1987,8 +2969,13 @@ void loop() {
     // Quick Delta off - don't wait for confirmation
     quickDeltaOff();
 
+    // Reset ALL test states
     status.running = false;
     status.mode = MODE_IDLE;
+    sgsConfig.sgsTestActive = false;
+    sgsConfig.sgsCurrentPhase = 0;
+    whTest.active = false;
+    whTest.phase = 0;
     stopRequested = false;
     stopInProgress = false;
 
@@ -2009,7 +2996,25 @@ void loop() {
   if (millis() - lastUpd >= 2000) {
     lastUpd = millis();
     if (status.running && !stopRequested) {
-      updateTest();
+      // SGS/Anorgion test has its own state machine with cutoff current detection
+      if (sgsConfig.sgsTestActive) {
+        // Read measurements for SGS mode
+        deltaReadMeasurements();
+        readTemp();
+        appendLogEntry();
+        yield();
+        updateSGSTest();
+      } else if (whTest.active) {
+        // Wh capacity test mode
+        deltaReadMeasurements();
+        readTemp();
+        appendLogEntry();
+        yield();
+        updateWhTest();
+      } else {
+        // Normal mode - updateTest handles everything
+        updateTest();
+      }
       yield();
     }
   }
@@ -2020,6 +3025,42 @@ void loop() {
     lastTemp = millis();
     if (!status.running) {
       readTemp();
+      yield();
+    }
+  }
+
+  // Read Delta measurements every 5 seconds when idle (to keep display updated)
+  // Uses shorter timeout to avoid blocking web requests too long
+  static unsigned long lastIdleDelta = 0;
+  if (millis() - lastIdleDelta >= 5000) {
+    lastIdleDelta = millis();
+    if (!status.running && !stopRequested) {
+      // Quick single voltage read to check if Delta is responsive
+      if (deltaClient.connected() || deltaConnect()) {
+        // Handle any pending web requests first
+        server.handleClient();
+        yield();
+
+        // Quick voltage query with shorter effective timeout (exit early on response)
+        String vStr = deltaQuery("MEASure:VOLtage?");
+        if (vStr.length() > 0) {
+          server.handleClient();
+          yield();
+          String iStr = deltaQuery("MEASure:CURrent?");
+          server.handleClient();
+          yield();
+          String pStr = deltaQuery("MEASure:POWer?");
+
+          float v = vStr.toFloat();
+          float i = iStr.toFloat();
+          float p = pStr.toFloat();
+          if (v >= 0 && v <= 100) {
+            status.voltage = v;
+            status.current = i;
+            status.power = p;
+          }
+        }
+      }
       yield();
     }
   }

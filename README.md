@@ -1,4 +1,4 @@
-# Dinstinct Battery Tester v7.1
+# Dinstinct Battery Tester v7.3
 
 Professional battery testing system with thermal imaging, web interface, and comprehensive safety features.
 
@@ -9,6 +9,7 @@ Professional battery testing system with thermal imaging, web interface, and com
 - **Temperature Sensor**: DS18B20 (OneWire)
 - **Thermal Camera**: MLX90640 32x24 IR array (optional)
 - **Audio**: ES8311 codec for audible feedback
+- **Status LED**: Blue LED on GPIO 22
 
 ## Features
 
@@ -16,6 +17,8 @@ Professional battery testing system with thermal imaging, web interface, and com
 - **Charge Mode**: Constant voltage charging with configurable current limit
 - **Discharge Mode**: Controlled discharge to specified cutoff voltage
 - **Cycle Mode**: Automated charge/discharge cycles for capacity testing
+- **Anorgion Test**: Multi-cycle test with configurable parameters and cutoff current detection
+- **Wh Capacity Test**: Single cycle test at specified current to measure battery capacity
 - **Real-time Monitoring**: Voltage, current, power, temperature, Ah, Wh
 
 ### Web Interface
@@ -23,12 +26,13 @@ Professional battery testing system with thermal imaging, web interface, and com
 - Large 7-segment style displays for voltage/current/temperature
 - Real-time Chart.js graphs with voltage, current, and temperature
 - Thermal camera heatmap display (when MLX90640 connected)
+- Chunked page transfer for reliable loading during Delta communication
 
 ### Delta PSU Integration
 - **CV/CC Indicator**: Shows Constant Voltage or Constant Current mode
 - **Set vs Measured**: Compare programmed values with actual readings
 - **Cable Loss Detection**: Calculates voltage drop in cables using 4-wire sensing
-- Full SCPI control over TCP/IP
+- Full SCPI control over TCP/IP (port 8462)
 
 ### Safety System
 - **Hard Limits**: Absolute voltage and current boundaries that cannot be exceeded
@@ -36,6 +40,10 @@ Professional battery testing system with thermal imaging, web interface, and com
 - **Parameter Validation**: Blocks dangerous values (e.g., 250A or 20V)
 - **Safety Code Protection**: Required to modify safety limits
 - **Audit Logging**: All parameter changes and blocked attempts are logged
+
+### Status LED (GPIO 22)
+- **Fast blink (200ms)**: Test running
+- **Slow blink (1000ms)**: Idle/standby
 
 ### Thermal Monitoring
 - MLX90640 32x24 pixel thermal imaging
@@ -63,6 +71,7 @@ Professional battery testing system with thermal imaging, web interface, and com
 | Function | GPIO |
 |----------|------|
 | DS18B20 Temperature | 13 |
+| Blue Status LED | 22 |
 | I2C SDA (MLX90640) | 18 |
 | I2C SCL (MLX90640) | 23 |
 | PA Enable | 21 |
@@ -78,8 +87,14 @@ Edit `src/main.cpp` to set your network:
 ```cpp
 const char* WIFI_SSID = "Your_WiFi_SSID";
 const char* WIFI_PASS = "Your_WiFi_Password";
-const char* DELTA_IP = "192.168.1.27";  // Delta PSU IP
+const char* DELTA_IP = "192.168.1.16";  // Delta PSU IP
+const int DELTA_PORT = 8462;
 ```
+
+Current BTAC config:
+- WiFi: BTAC Medewerkers
+- ESP32 IP: 192.168.1.40
+- Delta IP: 192.168.1.16
 
 ## Building & Uploading
 
@@ -103,45 +118,78 @@ pio device monitor
 | `/` | Main dashboard |
 | `/settings` | Configuration page |
 | `/thermal` | Full-screen thermal view |
+| `/sgs` | Anorgion Test page |
+| `/whtest` | Wh Capacity Test page |
 | `/status` | JSON status data |
 | `/safety` | Safety limits (JSON) |
 | `/safety/log` | Safety audit log |
 | `/charge?v=X&i=Y` | Start charging |
 | `/discharge?v=X&i=Y` | Start discharging |
 | `/cycle` | Start auto cycle |
+| `/whtest/start` | Start Wh capacity test |
+| `/whtest/status` | Wh test status (JSON) |
+| `/sgs/start` | Start Anorgion test |
+| `/sgs/status` | Anorgion test status (JSON) |
 | `/stop` | Stop current test |
 | `/download` | Download CSV log |
 
-## Screenshots
+## Delta PSU Helper Scripts
 
-Access the web interface at `http://<ESP32_IP>/`
+PowerShell scripts voor directe Delta controle (in user home folder):
 
-## License
+```powershell
+# delta_stop.ps1 - Zet Delta output uit
+# delta_on.ps1 - Zet Delta output aan
+# delta_query.ps1 - Query Delta metingen
+# delta_setup_charge.ps1 - Setup voor laden (4.15V/12A)
+```
 
-MIT License
+## Current Status (28 Jan 2025)
 
-## Current Status (27 Jan 2025)
-
-**Versie: 7.2** - STOP button fix voor trage Delta PSU
+**Versie: 7.3** - Anorgion Test + Wh Capacity Test + Chunked Pages
 
 ### Wat werkt:
 - Laden/ontladen met Delta SM70-CP-450
-- STOP knop reageert nu tijdens tests
+- STOP knop reageert tijdens tests
 - Safety limits en bevestigingsdialogen
 - CV/CC mode indicator
 - Cable loss detectie
 - Data logging naar SPIFFS
+- **Blue LED status indicator** (fast=running, slow=idle)
+- **Anorgion Test pagina** met multi-cycle testing
+- **Wh Capacity Test pagina** voor capaciteitsmeting
+- **Chunked page transfer** - pagina's laden betrouwbaar
 
 ### Bekende issues:
-- Scherm update is traag (door Delta communicatie)
-- Delta queries blokkeren nog steeds ~800ms per query
+- Delta queries blokkeren ~800ms per query (hardware limitatie)
+- Bij Delta communicatie problemen: power cycle Delta PSU
 
-### TODO volgende sessie:
-1. **Blue LED status indicator op ESP32**
-   - Knipperen = normaal draaiend
-   - Continu aan = vastgelopen/frozen
-2. Optimaliseer Delta query frequentie
-3. Mogelijk async Delta communicatie
+### Tips:
+- Als ESP32 niet reageert: eerst Delta uitzetten, dan ESP32 resetten
+- Delta moet in REMOTE mode staan voor SCPI communicatie
+- Gebruik lange timeouts bij curl requests (30-60s) tijdens tests
+
+## Wh Capacity Test
+
+Meet de werkelijke capaciteit van een batterij:
+
+1. **Laad fase**: Laadt tot ingestelde spanning (default 4.15V) bij ingestelde stroom (default 12A)
+2. **Cutoff detectie**: Stopt laden wanneer stroom onder cutoff waarde zakt (default 1.5A)
+3. **Ontlaad fase**: Ontlaadt tot ingestelde spanning (default 2.70V) bij ingestelde stroom (default 12A)
+4. **Resultaat**: Toont Wh ontladen, Ah geladen/ontladen, energie-efficiëntie
+
+## Anorgion Test
+
+Multi-cycle test voor uitgebreide batterij karakterisering:
+
+- Configureerbare aantal cycles
+- Per-cycle tracking van Ah en Wh
+- Cutoff current detectie voor CV→CC transitie
+- Cycle history met efficiëntie per cycle
+
+## License
+
+MIT License
 
 ## Author
 
