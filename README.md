@@ -146,10 +146,17 @@ PowerShell scripts voor directe Delta controle (in user home folder):
 
 ## Current Status (28 Jan 2025)
 
-**Versie: 7.3** - Anorgion Test + Wh Capacity Test + Chunked Pages
+**Versie: 7.4** - CRITICAL SAFETY UPDATE
+
+### v7.4 Fixes (BELANGRIJK!):
+- **HARD VOLTAGE LIMITS**: Delta stopt ONMIDDELLIJK bij V < 2.70V of V > 4.15V
+- **Fixed SCPI truncation**: Stroommeting was soms afgekapt (-11A ipv -12A)
+- **Fixed discharge cutoff**: Stopt nu bij voltage OF stroom limiet (was: beide nodig)
+- **Double-tap safety**: Delta OFF commando wordt 2x gestuurd voor zekerheid
 
 ### Wat werkt:
 - Laden/ontladen met Delta SM70-CP-450
+- **HARDE VEILIGHEIDSLIMIETEN** - kan NOOIT onder 2.70V of boven 4.15V komen
 - STOP knop reageert tijdens tests
 - Safety limits en bevestigingsdialogen
 - CV/CC mode indicator
@@ -163,6 +170,7 @@ PowerShell scripts voor directe Delta controle (in user home folder):
 ### Bekende issues:
 - Delta queries blokkeren ~800ms per query (hardware limitatie)
 - Bij Delta communicatie problemen: power cycle Delta PSU
+- Voltage display kan 0.01V afwijken van Delta LCD (afrondingsverschil)
 
 ### Tips:
 - Als ESP32 niet reageert: eerst Delta uitzetten, dan ESP32 resetten

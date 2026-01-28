@@ -1,6 +1,9 @@
 /*
- * Battery Tester v7.1 - WITH MLX90640 THERMAL CAMERA + SAFETY
- * Based on v7.0 + comprehensive safety features
+ * Battery Tester v7.4 - HARD SAFETY LIMITS
+ * Based on v7.3 + CRITICAL safety fixes:
+ * - Fixed SCPI response truncation (was cutting off at 4 chars)
+ * - Added HARD voltage limits: IMMEDIATE stop if V < 2.70V or V > 4.15V
+ * - Fixed discharge cutoff: stops on voltage OR current, not both
  *
  * Hardware:
  * - ESP32 LyraT v1.2
@@ -549,8 +552,14 @@ String deltaQuery(String cmd) {
 
     if (deltaClient.available()) {
       char c = deltaClient.read();
-      if (c >= 32 && c <= 126) response += c;
-      if (response.length() > 3) break;  // Got response, exit early
+      // Stop on newline/carriage return (end of SCPI response)
+      if (c == '\n' || c == '\r') {
+        if (response.length() > 0) break;  // Got complete response
+      } else if (c >= 32 && c <= 126) {
+        response += c;
+      }
+      // Safety limit: max 15 chars (e.g., "-12.3456" is 9 chars max)
+      if (response.length() >= 15) break;
     } else {
       delay(5);
     }
@@ -705,6 +714,43 @@ bool deltaReadMeasurements() {
   float v = vStr.toFloat();
   float i = iStr.toFloat();
   float p = pStr.toFloat();
+
+  // ============== HARD SAFETY LIMITS - IMMEDIATE STOP ==============
+  // These limits are NON-NEGOTIABLE. If voltage is outside safe range,
+  // we IMMEDIATELY turn off Delta output, no matter what.
+  #define HARD_MIN_VOLTAGE 2.70
+  #define HARD_MAX_VOLTAGE 4.15
+
+  if (v > 0.5 && v < HARD_MIN_VOLTAGE) {
+    // CRITICAL: Battery voltage too low! STOP IMMEDIATELY!
+    Serial.printf("\n!!! HARD SAFETY STOP: V=%.3fV < %.2fV !!!\n", v, HARD_MIN_VOLTAGE);
+    deltaSet("OUTPut OFF");
+    delay(100);
+    deltaSet("OUTPut OFF");  // Send twice to be sure
+    stopRequested = true;
+    status.running = false;
+    status.mode = MODE_IDLE;
+    status.lastError = "HARD STOP: Voltage below " + String(HARD_MIN_VOLTAGE, 2) + "V";
+    logSafetyEvent("HARD STOP: V=" + String(v, 3) + "V < min");
+    beepFail();
+    return false;
+  }
+
+  if (v > HARD_MAX_VOLTAGE) {
+    // CRITICAL: Battery voltage too high! STOP IMMEDIATELY!
+    Serial.printf("\n!!! HARD SAFETY STOP: V=%.3fV > %.2fV !!!\n", v, HARD_MAX_VOLTAGE);
+    deltaSet("OUTPut OFF");
+    delay(100);
+    deltaSet("OUTPut OFF");  // Send twice to be sure
+    stopRequested = true;
+    status.running = false;
+    status.mode = MODE_IDLE;
+    status.lastError = "HARD STOP: Voltage above " + String(HARD_MAX_VOLTAGE, 2) + "V";
+    logSafetyEvent("HARD STOP: V=" + String(v, 3) + "V > max");
+    beepFail();
+    return false;
+  }
+  // ============== END HARD SAFETY LIMITS ==============
 
   if (v >= 0 && v <= 100) {
     status.voltage = v;
@@ -2724,20 +2770,31 @@ void updateWhTest() {
       break;
 
     case 2: // Discharging
-      if (status.voltage <= whTest.dischargeVoltage + 0.02 && status.voltage > 0.5) {
-        if (abs(status.current) < 1.0) {
-          Serial.printf("[WhTest] Discharge complete: %.3f Ah, %.2f Wh\n", whTest.ahDischarge, whTest.whDischarge);
+      // FIXED: Stop when voltage reaches limit OR current drops below threshold
+      // Previously required BOTH conditions which was dangerous!
+      if (status.voltage > 0.5) {
+        bool voltageReached = (status.voltage <= whTest.dischargeVoltage + 0.02);
+        bool currentLow = (abs(status.current) < 1.0);
+
+        // Stop if EITHER condition is met (voltage limit is primary!)
+        if (voltageReached || currentLow) {
+          Serial.printf("[WhTest] Discharge complete: %.3f Ah, %.2f Wh (V=%.3f, I=%.2f)\n",
+            whTest.ahDischarge, whTest.whDischarge, status.voltage, status.current);
           playTone(600, 200);
 
-          // Test complete
+          // Test complete - STOP IMMEDIATELY
           quickDeltaOff();
+          delay(100);
+          quickDeltaOff();  // Double-tap for safety
+
           whTest.phase = 3;
           whTest.active = false;
           status.running = false;
           status.mode = MODE_IDLE;
 
           beepDone();
-          logSafetyEvent("Wh Test complete: " + String(whTest.whDischarge, 2) + " Wh");
+          String reason = voltageReached ? "voltage limit" : "current low";
+          logSafetyEvent("Wh Test complete (" + reason + "): " + String(whTest.whDischarge, 2) + " Wh");
         }
       }
       break;
@@ -2875,16 +2932,24 @@ void updateSGSTest() {
       break;
 
     case 3: // DISCHARGING (CC)
-      // Check if voltage dropped to cutoff
-      if (status.voltage <= sgsConfig.dischargeVoltage + 0.02 && status.voltage > 0.5) {
-        // Check if current is low (near end of discharge)
-        if (abs(status.current) < 2.0) {
-          Serial.printf("[SGS] Cycle %d: Discharge complete (V=%.3fV, I=%.2fA)\n",
-            status.currentCycle, status.voltage, status.current);
+      // FIXED: Stop when voltage reaches limit OR current is low
+      // Voltage limit is the PRIMARY safety condition!
+      if (status.voltage > 0.5) {
+        bool voltageReached = (status.voltage <= sgsConfig.dischargeVoltage + 0.02);
+        bool currentLow = (abs(status.current) < 2.0);
+
+        // Stop if EITHER condition is met
+        if (voltageReached || currentLow) {
+          Serial.printf("[SGS] Cycle %d: Discharge complete (V=%.3fV, I=%.2fA, reason=%s)\n",
+            status.currentCycle, status.voltage, status.current,
+            voltageReached ? "voltage" : "current");
           playTone(600, 150);
 
-          // Stop discharging, start rest
+          // Stop discharging - IMMEDIATELY
           quickDeltaOff();
+          delay(100);
+          quickDeltaOff();  // Double-tap for safety
+
           sgsConfig.sgsCurrentPhase = 4; // Rest after discharge
           sgsConfig.phaseStartTime = millis();
 
