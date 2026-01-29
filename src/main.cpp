@@ -114,7 +114,9 @@ float remoteMlxMax = 0;
 float remoteMlxAvg = 0;
 bool remoteSensorOnline = false;
 unsigned long lastRemoteFetch = 0;
+int remoteFetchFails = 0;
 #define REMOTE_FETCH_INTERVAL_MS 5000
+#define REMOTE_FETCH_FAIL_BACKOFF_MS 30000  // 30s backoff when sensor board offline
 
 // Forward declarations
 void quickDeltaOff();
@@ -523,8 +525,8 @@ bool deltaConnect() {
   deltaClient.setTimeout(1);  // 1 sec timeout - minimize Core 0 blocking
   if (!deltaClient.connect(DELTA_IP, DELTA_PORT)) {
     deltaConnectFails++;
-    // Exponential backoff: 2s, 5s, 10s, 20s, 30s max
-    deltaBackoffMs = min(30000UL, (unsigned long)(2000 * (1 << min(deltaConnectFails - 1, 4))));
+    // Exponential backoff: 2s, 4s, 8s, 10s max
+    deltaBackoffMs = min(10000UL, (unsigned long)(2000 * (1 << min(deltaConnectFails - 1, 3))));
     deltaNextConnectAllowed = millis() + deltaBackoffMs;
     if (deltaConnectFails <= 3 || deltaConnectFails % 10 == 0) {
       Serial.printf("[DELTA] Connect FAILED (%d fails, next retry in %lus)\n", deltaConnectFails, deltaBackoffMs / 1000);
@@ -534,39 +536,72 @@ bool deltaConnect() {
   }
 
   status.deltaConnected = true;
-  delay(200);  // Give Delta time to be ready
+  delay(300);  // Give Delta time after TCP connect
   yield();
-  while(deltaClient.available()) deltaClient.read();
 
-  // Health check: verify SCPI is responsive
-  deltaClient.print("*IDN?\r\n");
-  delay(80);
+  // SCPI reset sequence: flush any stuck parser state from previous abrupt disconnect
+  // Send empty lines to clear partial command buffer, then *CLS to reset status
+  deltaClient.print("\r\n\r\n");
+  delay(100);
+  while(deltaClient.available()) deltaClient.read();  // Drain garbage
+  deltaClient.print("*CLS\r\n");
+  delay(100);
+  while(deltaClient.available()) deltaClient.read();  // Drain again
+
+  // Now try *IDN? - attempt up to 3 times with increasing delay
   String idn = "";
-  unsigned long start = millis();
-  while (millis() - start < 800) {
-    if (deltaClient.available()) {
-      char c = deltaClient.read();
-      if (c == '\n' || c == '\r') { if (idn.length() > 0) break; }
-      else if (c >= 32 && c <= 126) idn += c;
-    } else { delay(5); }
-    yield();
+  for (int idnTry = 0; idnTry < 3 && idn.length() == 0; idnTry++) {
+    if (idnTry > 0) {
+      // Retry: disconnect TCP and reconnect fresh
+      deltaClient.stop();
+      delay(500);
+      if (!deltaClient.connect(DELTA_IP, DELTA_PORT)) {
+        Serial.printf("[DELTA] IDN retry %d: reconnect failed\n", idnTry + 1);
+        continue;
+      }
+      delay(300);
+      deltaClient.print("\r\n\r\n");
+      delay(100);
+      while(deltaClient.available()) deltaClient.read();
+      deltaClient.print("*CLS\r\n");
+      delay(100);
+      while(deltaClient.available()) deltaClient.read();
+    }
+
+    deltaClient.print("*IDN?\r\n");
+    delay(200);
+
+    unsigned long start = millis();
+    while (millis() - start < 2000) {
+      if (deltaClient.available()) {
+        char c = deltaClient.read();
+        if (c == '\n' || c == '\r') { if (idn.length() > 0) break; }
+        else if (c >= 32 && c <= 126) idn += c;
+      } else { delay(10); }
+      yield();
+    }
+
+    if (idn.length() == 0) {
+      Serial.printf("[DELTA] IDN attempt %d: no response\n", idnTry + 1);
+    }
   }
 
   if (idn.length() > 0) {
-    // SUCCESS - reset backoff
+    // SUCCESS - reset backoff and clear any old error
     deltaConnectFails = 0;
     deltaBackoffMs = 0;
     deltaNextConnectAllowed = 0;
+    status.lastError = "";
     Serial.printf("[DELTA] Connected OK - %s\n", idn.c_str());
     return true;
   }
 
-  // SCPI not responding - connection is useless, count as failure for backoff
+  // SCPI not responding after 3 attempts
   deltaConnectFails++;
-  deltaBackoffMs = min(30000UL, (unsigned long)(2000 * (1 << min(deltaConnectFails - 1, 4))));
+  deltaBackoffMs = min(10000UL, (unsigned long)(2000 * (1 << min(deltaConnectFails - 1, 3))));
   deltaNextConnectAllowed = millis() + deltaBackoffMs;
   Serial.printf("[DELTA] SCPI NOT RESPONDING (%d fails, next retry in %lus)\n", deltaConnectFails, deltaBackoffMs / 1000);
-  status.lastError = "Delta SCPI not responding - power cycle Delta!";
+  status.lastError = "Delta SCPI not responding";
   deltaClient.stop();
   status.deltaConnected = false;
   return false;
@@ -3279,14 +3314,21 @@ void deltaRestHold() {
 WiFiClient remoteClient;
 
 void fetchRemoteSensorData() {
-  if (millis() - lastRemoteFetch < REMOTE_FETCH_INTERVAL_MS) return;
+  // Use longer interval if sensor board has been offline (don't spam TCP stack)
+  unsigned long interval = (remoteFetchFails >= 3) ? REMOTE_FETCH_FAIL_BACKOFF_MS : REMOTE_FETCH_INTERVAL_MS;
+  if (millis() - lastRemoteFetch < interval) return;
   lastRemoteFetch = millis();
+
+  // Don't attempt remote fetch if Delta isn't connected yet - TCP stack contention
+  // causes *IDN? responses to be missed during Delta connect phase
+  if (!status.deltaConnected) return;
 
   if (WiFi.status() != WL_CONNECTED) return;
 
-  remoteClient.setTimeout(2);  // 2 second timeout
+  remoteClient.setTimeout(1);  // 1 second timeout (was 2s - too long, blocks TCP stack)
   if (!remoteClient.connect(REMOTE_SENSOR_IP, 80)) {
     remoteSensorOnline = false;
+    remoteFetchFails++;
     return;
   }
 
@@ -3317,6 +3359,7 @@ void fetchRemoteSensorData() {
 
   if (payload.length() > 5) {
     remoteSensorOnline = true;
+    remoteFetchFails = 0;  // Reset fail counter on success
     int idx;
     idx = payload.indexOf("\"t1\":");
     if (idx >= 0) remoteDsTemp1 = payload.substring(idx + 5).toFloat();
