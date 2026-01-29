@@ -1,5 +1,5 @@
 /*
- * Battery Tester v7.4 - HARD SAFETY LIMITS
+ * Battery Tester v7.5 - HARD SAFETY LIMITS
  * Based on v7.3 + CRITICAL safety fixes:
  * - Fixed SCPI response truncation (was cutting off at 4 chars)
  * - Added HARD voltage limits: IMMEDIATE stop if V < 2.70V or V > 4.15V
@@ -512,11 +512,17 @@ void beepThermalWarn(){playTone(2000,100);playSilence(100);playTone(2000,100);}
 // ============== DELTA COMMUNICATIE ==============
 
 bool deltaConnect() {
+  // Don't kill existing healthy connection
+  if (deltaClient.connected()) {
+    return true;
+  }
+
+  // Only stop if we need to reconnect
   deltaClient.stop();
   delay(200);
   yield();
 
-  deltaClient.setTimeout(10);  // Increased timeout for slow Delta
+  deltaClient.setTimeout(10);
   if (!deltaClient.connect(DELTA_IP, DELTA_PORT)) {
     Serial.println("[DELTA] Connect FAILED");
     status.deltaConnected = false;
@@ -527,7 +533,16 @@ bool deltaConnect() {
   delay(300);  // Give Delta time to be ready
   yield();
   while(deltaClient.available()) deltaClient.read();
+  Serial.println("[DELTA] Connected OK");
   return true;
+}
+
+// Force reconnect - only use when you explicitly need a fresh connection
+bool deltaForceReconnect() {
+  deltaClient.stop();
+  delay(200);
+  status.deltaConnected = false;
+  return deltaConnect();
 }
 
 String deltaQuery(String cmd) {
@@ -535,33 +550,29 @@ String deltaQuery(String cmd) {
     if (!deltaConnect()) return "";
   }
 
-  yield();
-  server.handleClient();  // Handle web requests!
-
+  // Drain any leftover bytes from previous responses
   while(deltaClient.available()) deltaClient.read();
 
-  deltaClient.print(cmd + "\n");
+  deltaClient.print(cmd + "\r\n");
   deltaClient.flush();
   delay(30);
 
   String response = "";
   unsigned long start = millis();
-  unsigned long timeout = 800;  // Shorter timeout - don't block too long
+  unsigned long timeout = 1500;  // Generous timeout for slow Delta
 
   while ((millis() - start) < timeout) {
     yield();
-    server.handleClient();  // Keep handling web requests!
+    // NO server.handleClient() here - prevents re-entrant SCPI corruption
 
     if (deltaClient.available()) {
       char c = deltaClient.read();
-      // Stop on newline/carriage return (end of SCPI response)
       if (c == '\n' || c == '\r') {
-        if (response.length() > 0) break;  // Got complete response
+        if (response.length() > 0) break;
       } else if (c >= 32 && c <= 126) {
         response += c;
       }
-      // Safety limit: max 15 chars (e.g., "-12.3456" is 9 chars max)
-      if (response.length() >= 15) break;
+      if (response.length() >= 30) break;
     } else {
       delay(5);
     }
@@ -569,7 +580,7 @@ String deltaQuery(String cmd) {
 
   response.trim();
   if (response.length() > 0) {
-    status.lastDeltaSuccess = millis();  // Mark successful communication
+    status.lastDeltaSuccess = millis();
   }
   return response;
 }
@@ -578,19 +589,20 @@ void deltaSet(String cmd) {
   if (!deltaClient.connected()) {
     if (!deltaConnect()) return;
   }
-  yield();
-  server.handleClient();  // Handle web requests!
-  deltaClient.print(cmd + "\n");
+  // NO server.handleClient() here - prevents re-entrant SCPI corruption
+  deltaClient.print(cmd + "\r\n");
   deltaClient.flush();
-  delay(50);
+  delay(80);  // Give Delta time to process command
   yield();
-  server.handleClient();  // Handle web requests!
 }
 
 bool deltaSetupCharge(float voltage, float current) {
   Serial.printf("[DELTA] Setup CHARGE: %.2fV %.1fA\n", voltage, current);
 
-  if (!deltaConnect()) return false;
+  // Use existing connection if healthy, only reconnect if needed
+  if (!deltaClient.connected()) {
+    if (!deltaConnect()) return false;
+  }
 
   yield();
   deltaSet("OUTPut OFF");
@@ -635,7 +647,10 @@ bool deltaSetupCharge(float voltage, float current) {
 bool deltaSetupDischarge(float voltage, float current) {
   Serial.printf("[DELTA] Setup DISCHARGE: %.2fV %.1fA\n", voltage, current);
 
-  if (!deltaConnect()) return false;
+  // Use existing connection if healthy, only reconnect if needed
+  if (!deltaClient.connected()) {
+    if (!deltaConnect()) return false;
+  }
 
   yield();
   deltaSet("OUTPut OFF");
@@ -721,7 +736,7 @@ bool deltaReadMeasurements() {
   // Check stop FIRST
   if (stopRequested) return false;
 
-  server.handleClient();  // Handle web requests!
+  // NO server.handleClient() here - prevents re-entrant SCPI corruption
   yield();
 
   if (!deltaClient.connected()) {
@@ -763,9 +778,7 @@ bool deltaReadMeasurements() {
   #define HARD_MIN_VOLTAGE 2.70
   #define HARD_MAX_VOLTAGE 4.15
 
-  // LOW VOLTAGE CHECK TEMPORARILY DISABLED FOR BATTERY RECOVERY
-  // TODO: Re-enable after battery is recovered above 2.7V
-  /*
+  // LOW VOLTAGE HARD SAFETY - RE-ENABLED v7.5
   if (v > 0.5 && v < HARD_MIN_VOLTAGE && i < -0.5) {
     Serial.printf("\n!!! HARD SAFETY STOP: V=%.3fV < %.2fV (discharging) !!!\n", v, HARD_MIN_VOLTAGE);
     deltaSet("OUTPut OFF");
@@ -779,7 +792,6 @@ bool deltaReadMeasurements() {
     beepFail();
     return false;
   }
-  */
 
   if (v > HARD_MAX_VOLTAGE) {
     // CRITICAL: Battery voltage too high! STOP IMMEDIATELY!
@@ -804,15 +816,12 @@ bool deltaReadMeasurements() {
 
     // Read programmed/set values - but check stop between each!
     if (stopRequested) return false;
-    server.handleClient();
     String setVStr = deltaQuery("SOURce:VOLtage?");
 
     if (stopRequested) return false;
-    server.handleClient();
     String setIStr = deltaQuery("SOURce:CURrent?");
 
     if (stopRequested) return false;
-    server.handleClient();
     String setINegStr = deltaQuery("SOURce:CURrent:NEGative?");
 
     if (setVStr.length() > 0) {
@@ -891,17 +900,17 @@ void deltaStop() {
     yield();
     if (deltaClient.connected() || deltaConnect()) {
       // Zero setpoints first to prevent residual current
-      deltaClient.print("SOURce:CURrent 0\n");
-      delay(30);
-      deltaClient.print("SOURce:CURrent:NEGative 0\n");
-      delay(30);
-      deltaClient.print("SOURce:POWer 0\n");
-      delay(30);
-      deltaClient.print("SOURce:POWer:NEGative 0\n");
-      delay(30);
-      deltaClient.print("SOURce:VOLtage 0\n");
-      delay(30);
-      deltaClient.print("OUTPut OFF\n");
+      deltaClient.print("SOURce:CURrent 0\r\n");
+      delay(80);
+      deltaClient.print("SOURce:CURrent:NEGative 0\r\n");
+      delay(80);
+      deltaClient.print("SOURce:POWer 0\r\n");
+      delay(80);
+      deltaClient.print("SOURce:POWer:NEGative 0\r\n");
+      delay(80);
+      deltaClient.print("SOURce:VOLtage 0\r\n");
+      delay(80);
+      deltaClient.print("OUTPut OFF\r\n");
       deltaClient.flush();
       delay(200);
       yield();
@@ -923,7 +932,7 @@ String deltaPing() {
   }
 
   String idn = deltaQuery("*IDN?");
-  deltaClient.stop();
+  // Don't close connection - leave it for future use
 
   if (idn.length() > 5) {
     beepOK();
@@ -1297,7 +1306,7 @@ void sendMainPage() {
   yield();  // Allow other tasks before building page
   String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
   h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  h += "<title>Battery Tester v7.4</title>";
+  h += "<title>Battery Tester v7.5</title>";
   h += "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>";
   h += "<link href='https://fonts.googleapis.com/css2?family=DSEG7+Classic:wght@400;700&display=swap' rel='stylesheet'>";
   h += "<style>";
@@ -1344,7 +1353,7 @@ void sendMainPage() {
   h += "@media(max-width:900px){.main-grid{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}.controls{grid-template-columns:1fr}.seg-display{flex-direction:column;align-items:center}}";
   h += "</style></head><body>";
 
-  h += "<h1>Battery Tester v7.4</h1>";
+  h += "<h1>Battery Tester v7.5</h1>";
   h += "<div class='st' id='st'>Loading...</div>";
   h += "<div class='err' id='err' style='display:none'></div>";
 
@@ -1437,7 +1446,7 @@ void sendMainPage() {
   h += "<div class='panel'><h2>Thermal Camera</h2>";
   h += "<div id='mlxStatus'>Checking...</div>";
   h += "<div class='thermal-container' id='thermalContainer' style='display:none'>";
-  h += "<canvas id='thermal' class='thermal-img' width='320' height='240'></canvas>";
+  h += "<canvas id='thermal' class='thermal-img' width='640' height='480' style='width:100%;max-width:640px;height:auto'></canvas>";
   h += "<div class='thermal-stats'>";
   h += "<div class='thermal-stat'><div class='label'>MIN</div><div class='val tmin' id='tmin'>--</div></div>";
   h += "<div class='thermal-stat'><div class='label'>MAX</div><div class='val tmax' id='tmax'>--</div></div>";
@@ -2312,6 +2321,11 @@ void handleThermalData() {
 }
 
 void handlePing() {
+  // Block ping during active test - it would destroy the TCP connection
+  if (status.running) {
+    server.send(200, "application/json", "{\"result\":\"BLOCKED: Test running - ping would kill connection\"}");
+    return;
+  }
   String r = deltaPing();
   server.send(200, "application/json", "{\"result\":\"" + r + "\"}");
 }
@@ -2883,7 +2897,7 @@ void updateWhTest() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n========== Battery Tester v7.4 - HARD SAFETY LIMITS ==========\n");
+  Serial.println("\n========== Battery Tester v7.5 - HARD SAFETY LIMITS ==========\n");
 
   initSPIFFS();
   loadConfig();
@@ -3089,18 +3103,18 @@ void quickDeltaOff() {
   }
   if (deltaClient.connected()) {
     // Zero all setpoints FIRST to prevent residual current flow
-    deltaClient.print("SOURce:CURrent 0\n");
-    delay(50);
-    deltaClient.print("SOURce:CURrent:NEGative 0\n");
-    delay(50);
-    deltaClient.print("SOURce:POWer 0\n");
-    delay(50);
-    deltaClient.print("SOURce:POWer:NEGative 0\n");
-    delay(50);
-    deltaClient.print("SOURce:VOLtage 0\n");
-    delay(50);
+    deltaClient.print("SOURce:CURrent 0\r\n");
+    delay(80);
+    deltaClient.print("SOURce:CURrent:NEGative 0\r\n");
+    delay(80);
+    deltaClient.print("SOURce:POWer 0\r\n");
+    delay(80);
+    deltaClient.print("SOURce:POWer:NEGative 0\r\n");
+    delay(80);
+    deltaClient.print("SOURce:VOLtage 0\r\n");
+    delay(80);
     // NOW turn output off
-    deltaClient.print("OUTPut OFF\n");
+    deltaClient.print("OUTPut OFF\r\n");
     deltaClient.flush();
     delay(300);  // Give Delta time to process before closing TCP
     Serial.println("[DELTA] Quick OFF - commands sent OK");
