@@ -1,4 +1,4 @@
-# Dinstinct Battery Tester v7.3
+# Dinstinct Battery Tester v7.5
 
 Professional battery testing system with thermal imaging, web interface, and comprehensive safety features.
 
@@ -68,18 +68,20 @@ Professional battery testing system with thermal imaging, web interface, and com
 
 ## Pin Configuration
 
-| Function | GPIO |
-|----------|------|
-| DS18B20 Temperature | 13 |
-| Blue Status LED | 22 |
-| I2C SDA (MLX90640) | 18 |
-| I2C SCL (MLX90640) | 23 |
-| PA Enable | 21 |
-| I2S MCLK | 0 |
-| I2S BCLK | 5 |
-| I2S LRCK | 25 |
-| I2S DOUT | 26 |
-| I2S DIN | 35 |
+| Function | GPIO | I2C Bus |
+|----------|------|---------|
+| DS18B20 Temperature | 13 | - |
+| Blue Status LED | 22 | - |
+| I2C SDA (ES8311 audio) | 18 | Wire (onboard) |
+| I2C SCL (ES8311 audio) | 23 | Wire (onboard) |
+| I2C SDA (MLX90640 thermal) | 15 (TDO test point) | Wire1 |
+| I2C SCL (MLX90640 thermal) | 14 (TMS test point) | Wire1 |
+| PA Enable | 21 | - |
+| I2S MCLK | 0 | - |
+| I2S BCLK | 5 | - |
+| I2S LRCK | 25 | - |
+| I2S DOUT | 26 | - |
+| I2S DIN | 35 | - |
 
 ## Network Configuration
 
@@ -144,11 +146,17 @@ PowerShell scripts voor directe Delta controle (in user home folder):
 # delta_setup_charge.ps1 - Setup voor laden (4.15V/12A)
 ```
 
-## Current Status (28 Jan 2025)
+## Current Status (29 Jan 2025)
 
-**Versie: 7.4** - CRITICAL SAFETY UPDATE
+**Versie: 7.5** - Live Parameter Update + Safety Fix
 
-### v7.4 Fixes (BELANGRIJK!):
+### v7.5 (29 Jan 2025):
+- **Live parameter update**: Stroom/spanning aanpassen tijdens laden/ontladen zonder Stop. Delta PSU wordt on-the-fly bijgewerkt via SCPI
+- **Safety stop fix**: quickDeltaOff() en deltaStop() zetten nu alle setpoints op 0 (V, I, I-, P, P-) voor OUTPut OFF. Voorkomt resterende -1.64A drain na Stop
+- **Idle safety monitor**: Spanningsbewaking ook in idle mode. Nood-shutdown bij V < 2.70V of V > 4.15V, zelfs als er geen test draait
+- **MLX90640 op Wire1**: Thermal camera verplaatst naar GPIO 15 (SDA) / GPIO 14 (SCL) via JTAG test points. ES8311 audio blijft op Wire (GPIO 18/23)
+
+### v7.4 (28 Jan 2025):
 - **HARD VOLTAGE LIMITS**: Delta stopt ONMIDDELLIJK bij V < 2.70V of V > 4.15V
 - **Fixed SCPI truncation**: Stroommeting was soms afgekapt (-11A ipv -12A)
 - **Fixed discharge cutoff**: Stopt nu bij voltage OF stroom limiet (was: beide nodig)
@@ -156,7 +164,9 @@ PowerShell scripts voor directe Delta controle (in user home folder):
 
 ### Wat werkt:
 - Laden/ontladen met Delta SM70-CP-450
+- **Live parameter update** - stroom/spanning aanpassen zonder Stop
 - **HARDE VEILIGHEIDSLIMIETEN** - kan NOOIT onder 2.70V of boven 4.15V komen
+- **Idle safety monitor** - bewaking ook als er geen test draait
 - STOP knop reageert tijdens tests
 - Safety limits en bevestigingsdialogen
 - CV/CC mode indicator
