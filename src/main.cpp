@@ -28,6 +28,12 @@
 #include <SPIFFS.h>
 #include <FS.h>
 
+// FreeRTOS for dual-core Delta communication
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
 // Adafruit MLX90640 library
 #include <Adafruit_MLX90640.h>
 
@@ -68,14 +74,55 @@ DallasTemperature tempSensor(&oneWire);
 Preferences prefs;
 
 volatile bool stopRequested = false;
-volatile bool deltaBusy = false;  // Prevents re-entrant Delta operations
+
+// ============== DUAL-CORE DELTA COMMUNICATION ==============
+// Core 0: Delta TCP/SCPI task (measurements, commands, safety)
+// Core 1: Arduino loop (web server, sensors, display, logging)
+// Communication via FreeRTOS queue - web server NEVER blocks on Delta
+
+enum DeltaCmdType {
+  DCMD_CHARGE_START,
+  DCMD_DISCHARGE_START,
+  DCMD_CYCLE_START,
+  DCMD_STOP,
+  DCMD_UPDATE_CHARGE,
+  DCMD_UPDATE_DISCHARGE,
+  DCMD_SGS_START,
+  DCMD_WHTEST_START,
+  DCMD_SGS_SETUP_CHARGE,
+  DCMD_SGS_SETUP_DISCHARGE
+};
+
+struct DeltaCmd {
+  DeltaCmdType type;
+  float voltage;
+  float current;
+};
+
+QueueHandle_t deltaQueue = NULL;
+TaskHandle_t deltaTaskHandle = NULL;
+volatile bool deltaTaskReady = false;
+volatile bool deltaCommandBusy = false;  // True while Delta task processes a command
+volatile unsigned long lastDeltaMeasureTime = 0;  // When Core 0 last read measurements
 
 // Blue LED status indicator
 unsigned long lastLedToggle = 0;
 bool ledState = false;
 
-// Forward declaration for quick stop
+// Forward declarations
 void quickDeltaOff();
+void deltaTask(void* param);
+void updateSGSTest();
+void updateWhTest();
+void updateTest();
+void resetStats();
+void startNewLog();
+void resetCycleHistory();
+void startNewCyclePhase();
+void beepStart();
+void beepStop();
+void beepFail();
+void beepDone();
 
 // MLX90640 variables
 Adafruit_MLX90640 mlxSensor;
@@ -534,8 +581,32 @@ bool deltaConnect() {
   delay(300);  // Give Delta time to be ready
   yield();
   while(deltaClient.available()) deltaClient.read();
-  Serial.println("[DELTA] Connected OK");
-  return true;
+
+  // Health check: verify SCPI is responsive
+  deltaClient.print("*IDN?\r\n");
+  delay(100);
+  String idn = "";
+  unsigned long start = millis();
+  while (millis() - start < 1000) {
+    if (deltaClient.available()) {
+      char c = deltaClient.read();
+      if (c == '\n' || c == '\r') { if (idn.length() > 0) break; }
+      else if (c >= 32 && c <= 126) idn += c;
+    } else { delay(5); }
+    yield();
+  }
+
+  if (idn.length() > 0) {
+    Serial.printf("[DELTA] Connected OK - %s\n", idn.c_str());
+    return true;
+  }
+
+  // SCPI not responding - connection is useless
+  Serial.println("[DELTA] Connected but SCPI NOT RESPONDING! Delta may need power cycle.");
+  status.lastError = "Delta SCPI not responding - power cycle Delta!";
+  deltaClient.stop();
+  status.deltaConnected = false;
+  return false;
 }
 
 // Force reconnect - only use when you explicitly need a fresh connection
@@ -564,8 +635,7 @@ String deltaQuery(String cmd) {
 
   while ((millis() - start) < timeout) {
     yield();
-    // Safe: deltaBusy flag prevents re-entrant Delta operations from web handlers
-    server.handleClient();
+    // No server.handleClient() here - Delta runs on Core 0, web on Core 1
 
     if (deltaClient.available()) {
       char c = deltaClient.read();
@@ -595,8 +665,6 @@ void deltaSet(String cmd) {
   deltaClient.flush();
   delay(80);
   yield();
-  // Safe: deltaBusy flag prevents re-entrant Delta operations from web handlers
-  server.handleClient();
 }
 
 bool deltaSetupCharge(float voltage, float current) {
@@ -644,6 +712,12 @@ bool deltaSetupCharge(float voltage, float current) {
   String pSet = deltaQuery("SOURce:POWer?");
   Serial.printf("[DELTA] Set: V=%s I=%s P=%s\n", vSet.c_str(), iSet.c_str(), pSet.c_str());
 
+  // Verify Delta actually accepted the commands
+  if (vSet.length() == 0 && iSet.length() == 0) {
+    Serial.println("[DELTA] ERROR: Delta not responding to SCPI - charge setup FAILED!");
+    status.lastError = "Delta SCPI not responding - power cycle Delta!";
+    return false;
+  }
   return true;
 }
 
@@ -692,6 +766,11 @@ bool deltaSetupDischarge(float voltage, float current) {
   String pNeg = deltaQuery("SOURce:POWer:NEGative?");
   Serial.printf("[DELTA] Set: V=%s I-=%s P-=%s\n", vSet.c_str(), iNeg.c_str(), pNeg.c_str());
 
+  if (vSet.length() == 0 && iNeg.length() == 0) {
+    Serial.println("[DELTA] ERROR: Delta not responding to SCPI - discharge setup FAILED!");
+    status.lastError = "Delta SCPI not responding - power cycle Delta!";
+    return false;
+  }
   return true;
 }
 
@@ -736,31 +815,27 @@ bool deltaUpdateDischargeParams(float voltage, float current) {
 }
 
 bool deltaReadMeasurements() {
-  // Check stop FIRST
+  // Runs on Core 0 - no server.handleClient() needed, Core 1 handles web
   if (stopRequested) return false;
-  deltaBusy = true;
-  yield();
 
   if (!deltaClient.connected()) {
     if (!deltaConnect()) {
       status.measureFailCount++;
-      deltaBusy = false;
       return false;
     }
   }
 
-  // Check stop between each query - handle web requests between (not inside) queries
-  if (stopRequested) { deltaBusy = false; return false; }
+  if (stopRequested) return false;
   String vStr = deltaQuery("MEASure:VOLtage?");
-  server.handleClient(); yield();
+  yield();
 
-  if (stopRequested) { deltaBusy = false; return false; }
+  if (stopRequested) return false;
   String iStr = deltaQuery("MEASure:CURrent?");
-  server.handleClient(); yield();
+  yield();
 
-  if (stopRequested) { deltaBusy = false; return false; }
+  if (stopRequested) return false;
   String pStr = deltaQuery("MEASure:POWer?");
-  server.handleClient(); yield();
+  yield();
 
   if (vStr.length() == 0) {
     status.measureFailCount++;
@@ -769,7 +844,6 @@ bool deltaReadMeasurements() {
       deltaForceReconnect();
       status.measureFailCount = 0;
     }
-    deltaBusy = false;
     return false;
   }
 
@@ -821,17 +895,16 @@ bool deltaReadMeasurements() {
     status.current = i;
     status.power = p;
 
-    // Read programmed/set values - but check stop between each!
-    if (stopRequested) { deltaBusy = false; return false; }
-    server.handleClient(); yield();
+    // Read programmed/set values
+    if (stopRequested) return false;
     String setVStr = deltaQuery("SOURce:VOLtage?");
+    yield();
 
-    if (stopRequested) { deltaBusy = false; return false; }
-    server.handleClient(); yield();
+    if (stopRequested) return false;
     String setIStr = deltaQuery("SOURce:CURrent?");
+    yield();
 
-    if (stopRequested) { deltaBusy = false; return false; }
-    server.handleClient(); yield();
+    if (stopRequested) return false;
     String setINegStr = deltaQuery("SOURce:CURrent:NEGative?");
 
     if (setVStr.length() > 0) {
@@ -896,43 +969,20 @@ bool deltaReadMeasurements() {
     Serial.printf("[M] V=%.3f(set:%.2f) I=%.2f(set:%.1f) %s Loss=%.3fV\n",
       v, status.setVoltage, i, targetCurrent,
       status.cvMode ? "CV" : "CC", status.cableLoss);
-    deltaBusy = false;
+    lastDeltaMeasureTime = millis();
     return true;
   }
 
-  deltaBusy = false;
   return false;
 }
 
 void deltaStop() {
   Serial.println("[DELTA] STOP - Emergency shutdown");
-
-  // Try multiple times to ensure output is off
-  for (int attempt = 0; attempt < 3; attempt++) {
-    yield();
-    if (deltaClient.connected() || deltaConnect()) {
-      // Zero setpoints first to prevent residual current
-      deltaClient.print("SOURce:CURrent 0\r\n");
-      delay(80);
-      deltaClient.print("SOURce:CURrent:NEGative 0\r\n");
-      delay(80);
-      deltaClient.print("SOURce:POWer 0\r\n");
-      delay(80);
-      deltaClient.print("SOURce:POWer:NEGative 0\r\n");
-      delay(80);
-      deltaClient.print("SOURce:VOLtage 0\r\n");
-      delay(80);
-      deltaClient.print("OUTPut OFF\r\n");
-      deltaClient.flush();
-      delay(200);
-      yield();
-      Serial.printf("[DELTA] Stop attempt %d sent (with zero setpoints)\n", attempt + 1);
-    }
-  }
-
-  deltaClient.stop();
-  status.deltaConnected = false;
-  Serial.println("[DELTA] Output disabled, setpoints zeroed, connection closed");
+  // Use quickDeltaOff which has verification built in
+  quickDeltaOff();
+  delay(100);
+  quickDeltaOff();  // Double-tap for extra safety
+  Serial.println("[DELTA] STOP complete");
 }
 
 String deltaPing() {
@@ -1105,41 +1155,12 @@ void stopTest() {
 }
 
 void updateTest() {
-  if (!status.running || stopRequested) {
-    if (stopRequested) stopTest();
-    return;
-  }
+  // Called from Core 1 - measurements already done by Core 0
+  // Only handles cycle mode transitions via queue commands
+  if (!status.running || stopRequested) return;
+  if (status.voltage < 0.1) return;
 
-  deltaReadMeasurements();
-  readTemp();
-  appendLogEntry();
-
-  if (!status.running) return;
-
-  if (status.measureFailCount >= 10) {
-    status.lastError = "Communication lost";
-    stopTest();
-    beepFail();
-    return;
-  }
-
-  // DS18B20 temp alarm
-  if (status.temperature > config.tempAlarm) {
-    status.lastError = "TEMP ALARM (DS18B20)";
-    stopTest();
-    beepFail();
-    return;
-  }
-
-  // MLX90640 thermal alarm - check max temp
-  if (mlxConnected && mlxMax > config.thermalAlarm) {
-    status.lastError = "THERMAL ALARM (MLX90640): " + String(mlxMax, 1) + "C";
-    stopTest();
-    beepFail();
-    return;
-  }
-
-  // Log
+  // Log periodic status
   if (millis() - status.lastLogTime >= (unsigned long)config.logInterval * 1000) {
     status.lastLogTime = millis();
     char modeChar = 'I';
@@ -1151,120 +1172,66 @@ void updateTest() {
       status.totalAhCharge, status.totalAhDischarge);
   }
 
-  if (status.voltage < 0.1) return;
-
-  // Mode logic
-  switch (status.mode) {
-    case MODE_CHARGE:
+  // Cycle mode transitions - send commands to Core 0 via queue
+  if (status.mode == MODE_CYCLE) {
+    if (status.current >= -0.1) {
+      // Charging phase
       if (status.voltage >= config.maxVoltage - 0.02) {
         if (abs(status.current) < 4.0) {
           if (!status.lowCurrentActive) {
             status.lowCurrentActive = true;
             status.lowCurrentStartTime = millis();
-            Serial.println("[CHARGE] Low current detected, starting 2 min timer");
+            Serial.println("[CYCLE] Charge low current, starting 2 min timer");
           } else if (millis() - status.lowCurrentStartTime >= 120000) {
-            Serial.println("[CHARGE] Target reached (2 min low current)");
-            beepDone();
-            stopTest();
+            Serial.printf("[CYCLE %d] Full (2 min low current) -> discharge\n", status.currentCycle);
+            status.lowCurrentActive = false;
+            status.lowCurrentStartTime = 0;
+            // Send discharge setup to Core 0
+            DeltaCmd cmd = {DCMD_SGS_SETUP_DISCHARGE, config.minVoltage, config.dischargeCurrent};
+            xQueueSend(deltaQueue, &cmd, 0);
           }
         } else {
-          if (status.lowCurrentActive) {
-            Serial.println("[CHARGE] Current increased, timer reset");
-          }
+          if (status.lowCurrentActive) Serial.println("[CYCLE] Charge current increased, timer reset");
           status.lowCurrentActive = false;
           status.lowCurrentStartTime = 0;
         }
       }
-      break;
-
-    case MODE_DISCHARGE:
+    } else {
+      // Discharging phase
       if (status.voltage <= config.minVoltage + 0.02) {
         if (abs(status.current) < 4.0) {
           if (!status.lowCurrentActive) {
             status.lowCurrentActive = true;
             status.lowCurrentStartTime = millis();
-            Serial.println("[DISCHARGE] Low current detected, starting 2 min timer");
+            Serial.println("[CYCLE] Discharge low current, starting 2 min timer");
           } else if (millis() - status.lowCurrentStartTime >= 120000) {
-            Serial.println("[DISCHARGE] Target reached (2 min low current)");
-            beepDone();
-            stopTest();
+            Serial.printf("[CYCLE %d] Empty (2 min low current): %.3f Ah\n", status.currentCycle, status.cycleAhDischarge);
+            playTone(1000, 200);
+            status.lowCurrentActive = false;
+            status.lowCurrentStartTime = 0;
+            saveCycleToHistory(false);
+
+            if (status.currentCycle >= config.numCycles) {
+              beepDone();
+              stopRequested = true;
+              DeltaCmd cmd = {DCMD_STOP, 0, 0};
+              xQueueSend(deltaQueue, &cmd, 0);
+            } else {
+              status.currentCycle++;
+              status.totalAhDischarge = 0;
+              startNewCyclePhase();
+              // Send charge setup to Core 0
+              DeltaCmd cmd = {DCMD_SGS_SETUP_CHARGE, config.maxVoltage, config.chargeCurrent};
+              xQueueSend(deltaQueue, &cmd, 0);
+            }
           }
         } else {
-          if (status.lowCurrentActive) {
-            Serial.println("[DISCHARGE] Current increased, timer reset");
-          }
+          if (status.lowCurrentActive) Serial.println("[CYCLE] Discharge current increased, timer reset");
           status.lowCurrentActive = false;
           status.lowCurrentStartTime = 0;
         }
       }
-      break;
-
-    case MODE_CYCLE:
-      if (status.current >= -0.1) {
-        if (status.voltage >= config.maxVoltage - 0.02) {
-          if (abs(status.current) < 4.0) {
-            if (!status.lowCurrentActive) {
-              status.lowCurrentActive = true;
-              status.lowCurrentStartTime = millis();
-              Serial.println("[CYCLE] Charge low current, starting 2 min timer");
-            } else if (millis() - status.lowCurrentStartTime >= 120000) {
-              Serial.printf("[CYCLE %d] Full (2 min low current) -> discharge\n", status.currentCycle);
-              status.lowCurrentActive = false;
-              status.lowCurrentStartTime = 0;
-              deltaStop();
-              delay(2000);
-              deltaSetupDischarge(config.minVoltage, config.dischargeCurrent);
-            }
-          } else {
-            if (status.lowCurrentActive) {
-              Serial.println("[CYCLE] Charge current increased, timer reset");
-            }
-            status.lowCurrentActive = false;
-            status.lowCurrentStartTime = 0;
-          }
-        }
-      } else {
-        if (status.voltage <= config.minVoltage + 0.02) {
-          if (abs(status.current) < 4.0) {
-            if (!status.lowCurrentActive) {
-              status.lowCurrentActive = true;
-              status.lowCurrentStartTime = millis();
-              Serial.println("[CYCLE] Discharge low current, starting 2 min timer");
-            } else if (millis() - status.lowCurrentStartTime >= 120000) {
-              Serial.printf("[CYCLE %d] Empty (2 min low current): %.3f Ah\n", status.currentCycle, status.cycleAhDischarge);
-              playTone(1000, 200);
-              status.lowCurrentActive = false;
-              status.lowCurrentStartTime = 0;
-
-              // Save this cycle to history
-              saveCycleToHistory(false);  // false = discharge phase complete
-
-              if (status.currentCycle >= config.numCycles) {
-                beepDone();
-                stopTest();
-              } else {
-                status.currentCycle++;
-                status.totalAhDischarge = 0;
-                // Start fresh tracking for new cycle
-                startNewCyclePhase();
-                deltaStop();
-                delay(2000);
-                deltaSetupCharge(config.maxVoltage, config.chargeCurrent);
-              }
-            }
-          } else {
-            if (status.lowCurrentActive) {
-              Serial.println("[CYCLE] Discharge current increased, timer reset");
-            }
-            status.lowCurrentActive = false;
-            status.lowCurrentStartTime = 0;
-          }
-        }
-      }
-      break;
-
-    default:
-      break;
+    }
   }
 }
 
@@ -2335,13 +2302,9 @@ void handleThermalData() {
 }
 
 void handlePing() {
-  // Block ping during active test - it would destroy the TCP connection
-  if (status.running) {
-    server.send(200, "application/json", "{\"result\":\"BLOCKED: Test running - ping would kill connection\"}");
-    return;
-  }
-  String r = deltaPing();
-  server.send(200, "application/json", "{\"result\":\"" + r + "\"}");
+  // With dual-core, just report connection status (don't call Delta from Core 1)
+  String result = status.deltaConnected ? "Connected (dual-core)" : "Disconnected";
+  server.send(200, "application/json", "{\"result\":\"" + result + "\"}");
 }
 
 void handleCharge() {
@@ -2357,23 +2320,17 @@ void handleCharge() {
     return;
   }
 
-  // Live update if already charging - adjust Delta without stopping
+  // Live update if already charging
   if (status.running && status.mode == MODE_CHARGE) {
-    if (deltaBusy) {
-      server.send(503, "application/json", "{\"ok\":false,\"error\":\"Delta busy - try again\"}");
-      return;
-    }
-    logSafetyEvent("CHARGE LIVE UPDATE: V=" + String(v,2) + " I=" + String(i,1));
-    if (deltaUpdateChargeParams(v, i)) {
-      server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Parameters updated live\"}");
-    } else {
-      server.send(500, "application/json", "{\"ok\":false,\"error\":\"Delta live update failed\"}");
-    }
+    DeltaCmd cmd = {DCMD_UPDATE_CHARGE, v, i};
+    xQueueSend(deltaQueue, &cmd, 0);
+    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Parameters update queued\"}");
     return;
   }
 
   logSafetyEvent("CHARGE STARTED: V=" + String(v,2) + " I=" + String(i,1));
-  startCharge(v, i);
+  DeltaCmd cmd = {DCMD_CHARGE_START, v, i};
+  xQueueSend(deltaQueue, &cmd, 0);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -2390,23 +2347,17 @@ void handleDischarge() {
     return;
   }
 
-  // Live update if already discharging - adjust Delta without stopping
+  // Live update if already discharging
   if (status.running && status.mode == MODE_DISCHARGE) {
-    if (deltaBusy) {
-      server.send(503, "application/json", "{\"ok\":false,\"error\":\"Delta busy - try again\"}");
-      return;
-    }
-    logSafetyEvent("DISCHARGE LIVE UPDATE: V=" + String(v,2) + " I=" + String(i,1));
-    if (deltaUpdateDischargeParams(v, i)) {
-      server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Parameters updated live\"}");
-    } else {
-      server.send(500, "application/json", "{\"ok\":false,\"error\":\"Delta live update failed\"}");
-    }
+    DeltaCmd cmd = {DCMD_UPDATE_DISCHARGE, v, i};
+    xQueueSend(deltaQueue, &cmd, 0);
+    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Parameters update queued\"}");
     return;
   }
 
   logSafetyEvent("DISCHARGE STARTED: V=" + String(v,2) + " I=" + String(i,1));
-  startDischarge(v, i);
+  DeltaCmd cmd = {DCMD_DISCHARGE_START, v, i};
+  xQueueSend(deltaQueue, &cmd, 0);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -2428,24 +2379,22 @@ void handleCycle() {
   }
 
   logSafetyEvent("CYCLE STARTED: " + String(config.minVoltage,2) + "-" + String(config.maxVoltage,2) + "V");
-  startCycle();
+  DeltaCmd cmd = {DCMD_CYCLE_START, 0, 0};
+  xQueueSend(deltaQueue, &cmd, 0);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleStop() {
-  Serial.println("[WEB] STOP requested - setting flag only!");
+  Serial.println("[WEB] STOP requested");
 
-  // ONLY set flags - do NOT call deltaStop here!
-  // The main loop will handle the actual stop
-  stopRequested = true;
-  status.running = false;
-  status.mode = MODE_IDLE;
+  // Send stop command to Core 0 Delta task
+  stopRequested = true;  // Immediate flag for safety
+  DeltaCmd cmd = {DCMD_STOP, 0, 0};
+  xQueueSend(deltaQueue, &cmd, 0);
 
-  // Send response immediately
-  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Stop flag set\"}");
-
-  // Log it
-  Serial.println("[WEB] Stop flag set, returning to browser");
+  // Send response immediately - Core 0 handles the actual stop
+  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Stop command sent\"}");
+  Serial.println("[WEB] Stop command queued to Core 0");
 }
 
 void handleSave() {
@@ -2915,6 +2864,211 @@ void updateWhTest() {
   }
 }
 
+// ============== DELTA TASK (Core 0) ==============
+// Handles ALL Delta TCP/SCPI communication on a separate core
+// Web server on Core 1 NEVER blocks waiting for Delta
+
+void deltaTask(void* param) {
+  Serial.println("[CORE0] Delta task started");
+
+  // Initial Delta connection
+  delay(2000);  // Wait for WiFi to be fully stable
+  deltaConnect();
+  deltaTaskReady = true;
+
+  unsigned long lastMeasure = 0;
+
+  while (true) {
+    // 1. Process commands from web server (non-blocking)
+    DeltaCmd cmd;
+    while (xQueueReceive(deltaQueue, &cmd, 0) == pdTRUE) {
+      deltaCommandBusy = true;
+      switch (cmd.type) {
+        case DCMD_CHARGE_START: {
+          Serial.printf("\n===== CHARGE %.2fV %.1fA =====\n", cmd.voltage, cmd.current);
+          resetStats();
+          startNewLog();
+          if (deltaSetupCharge(cmd.voltage, cmd.current)) {
+            beepStart();
+            status.mode = MODE_CHARGE;
+            status.running = true;
+          } else {
+            status.lastError = "Delta connect failed";
+            beepFail();
+          }
+          break;
+        }
+        case DCMD_DISCHARGE_START: {
+          Serial.printf("\n===== DISCHARGE %.2fV %.1fA =====\n", cmd.voltage, cmd.current);
+          resetStats();
+          startNewLog();
+          if (deltaSetupDischarge(cmd.voltage, cmd.current)) {
+            beepStart();
+            status.mode = MODE_DISCHARGE;
+            status.running = true;
+          } else {
+            status.lastError = "Delta connect failed";
+            beepFail();
+          }
+          break;
+        }
+        case DCMD_CYCLE_START: {
+          Serial.printf("\n===== CYCLE %.2f-%.2fV =====\n", config.minVoltage, config.maxVoltage);
+          resetStats();
+          resetCycleHistory();
+          startNewLog();
+          if (deltaSetupCharge(config.maxVoltage, config.chargeCurrent)) {
+            beepStart();
+            status.mode = MODE_CYCLE;
+            status.running = true;
+            status.currentCycle = 1;
+          } else {
+            status.lastError = "Delta connect failed";
+            beepFail();
+          }
+          break;
+        }
+        case DCMD_STOP: {
+          Serial.println("[CORE0] Processing STOP command");
+          quickDeltaOff();
+          status.running = false;
+          status.mode = MODE_IDLE;
+          sgsConfig.sgsTestActive = false;
+          sgsConfig.sgsCurrentPhase = 0;
+          whTest.active = false;
+          whTest.phase = 0;
+          stopRequested = false;
+          logSafetyEvent("STOP executed via Core 0");
+          beepStop();
+          Serial.println("[CORE0] Stop complete");
+          break;
+        }
+        case DCMD_UPDATE_CHARGE: {
+          logSafetyEvent("CHARGE LIVE UPDATE: V=" + String(cmd.voltage, 2) + " I=" + String(cmd.current, 1));
+          deltaUpdateChargeParams(cmd.voltage, cmd.current);
+          break;
+        }
+        case DCMD_UPDATE_DISCHARGE: {
+          logSafetyEvent("DISCHARGE LIVE UPDATE: V=" + String(cmd.voltage, 2) + " I=" + String(cmd.current, 1));
+          deltaUpdateDischargeParams(cmd.voltage, cmd.current);
+          break;
+        }
+        case DCMD_SGS_SETUP_CHARGE: {
+          if (!deltaSetupCharge(cmd.voltage, cmd.current)) {
+            status.lastError = "Delta connection failed during SGS charge setup";
+            sgsConfig.sgsTestActive = false;
+            status.running = false;
+            status.mode = MODE_IDLE;
+            beepFail();
+          }
+          break;
+        }
+        case DCMD_SGS_SETUP_DISCHARGE: {
+          if (!deltaSetupDischarge(cmd.voltage, cmd.current)) {
+            status.lastError = "Delta connection failed during SGS discharge setup";
+            sgsConfig.sgsTestActive = false;
+            status.running = false;
+            status.mode = MODE_IDLE;
+            beepFail();
+          }
+          break;
+        }
+        default:
+          break;
+      }
+      deltaCommandBusy = false;
+    }
+
+    // 2. Check stop flag
+    if (stopRequested) {
+      Serial.println("[CORE0] Stop flag detected");
+      quickDeltaOff();
+      status.running = false;
+      status.mode = MODE_IDLE;
+      sgsConfig.sgsTestActive = false;
+      sgsConfig.sgsCurrentPhase = 0;
+      whTest.active = false;
+      whTest.phase = 0;
+      stopRequested = false;
+      logSafetyEvent("STOP executed via Core 0 (flag)");
+      beepStop();
+      Serial.println("[CORE0] Stop complete");
+    }
+
+    // 3. Periodic Delta measurements + test state machine
+    unsigned long measureInterval = status.running ? 2000 : 6000;
+    if (millis() - lastMeasure >= measureInterval) {
+      lastMeasure = millis();
+      if (deltaClient.connected() || deltaConnect()) {
+        if (status.running && !stopRequested) {
+          // Active test: full measurement read + test logic
+          deltaReadMeasurements();
+
+          // Run test state machine (needs Delta access for phase transitions)
+          if (status.running && !stopRequested) {
+            if (sgsConfig.sgsTestActive) {
+              updateSGSTest();
+            } else if (whTest.active) {
+              updateWhTest();
+            } else {
+              // Normal mode - check test conditions
+              if (status.measureFailCount >= 10) {
+                status.lastError = "Communication lost";
+                quickDeltaOff();
+                status.running = false;
+                status.mode = MODE_IDLE;
+                beepFail();
+              }
+              // Temperature checks handled by Core 1
+            }
+          }
+        } else if (!stopRequested) {
+          // Idle: quick V/I/P read for display + safety
+          String vStr = deltaQuery("MEASure:VOLtage?");
+          yield();
+          String iStr = deltaQuery("MEASure:CURrent?");
+          yield();
+          String pStr = deltaQuery("MEASure:POWer?");
+
+          if (vStr.length() > 0) {
+            float v = vStr.toFloat();
+            float i = iStr.toFloat();
+            float p = pStr.toFloat();
+            if (v >= 0 && v <= 100) {
+              status.voltage = v;
+              status.current = i;
+              status.power = p;
+            }
+
+            // IDLE SAFETY MONITOR
+            if (v > 0.5 && v < HARD_MIN_VOLTAGE && i < -0.5) {
+              Serial.printf("\n!!! IDLE SAFETY: V=%.3fV < %.2fV while draining %.2fA !!!\n", v, HARD_MIN_VOLTAGE, i);
+              logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V I=" + String(i, 2) + "A");
+              quickDeltaOff();
+              delay(100);
+              quickDeltaOff();
+              status.lastError = "IDLE SAFETY: Battery below " + String(HARD_MIN_VOLTAGE, 2) + "V!";
+              beepFail();
+            }
+            if (v > HARD_MAX_VOLTAGE) {
+              Serial.printf("\n!!! IDLE SAFETY: V=%.3fV > %.2fV !!!\n", v, HARD_MAX_VOLTAGE);
+              logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V > max");
+              quickDeltaOff();
+              delay(100);
+              quickDeltaOff();
+              status.lastError = "IDLE SAFETY: Battery above " + String(HARD_MAX_VOLTAGE, 2) + "V!";
+              beepFail();
+            }
+          }
+        }
+      }
+    }
+
+    // 4. Yield to other Core 0 tasks (WiFi stack etc.)
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
+
 // ============== SETUP ==============
 void setup() {
   Serial.begin(115200);
@@ -2988,7 +3142,27 @@ void setup() {
   readTemp();
   playTone(800, 100); playSilence(50); playTone(1000, 100); playSilence(50); playTone(1200, 150);
 
-  Serial.printf("\nReady: http://%s\n\n", WiFi.localIP().toString().c_str());
+  // Create Delta command queue
+  deltaQueue = xQueueCreate(10, sizeof(DeltaCmd));
+  if (!deltaQueue) {
+    Serial.println("[FATAL] Failed to create Delta command queue!");
+  }
+
+  // Launch Delta communication task on Core 0
+  // Core 1 = Arduino loop (web server, sensors)
+  // Core 0 = Delta TCP/SCPI (never blocks web server!)
+  xTaskCreatePinnedToCore(
+    deltaTask,        // Function
+    "DeltaTask",      // Name
+    8192,             // Stack size
+    NULL,             // Parameters
+    1,                // Priority
+    &deltaTaskHandle, // Handle
+    0                 // Core 0
+  );
+
+  Serial.printf("\nReady: http://%s\n", WiFi.localIP().toString().c_str());
+  Serial.println("[DUAL-CORE] Delta on Core 0, Web on Core 1\n");
 }
 
 // ============== SGS TEST UPDATE ==============
@@ -3115,45 +3289,96 @@ void updateSGSTest() {
 
 // ============== LOOP ==============
 
-// Quick Delta off - minimal blocking
+// Quick Delta off - with verification
 void quickDeltaOff() {
   Serial.println("[DELTA] Quick OFF - zeroing setpoints + output off");
-  // Reconnect if needed - safety is more important than speed
-  if (!deltaClient.connected()) {
-    Serial.println("[DELTA] Quick OFF - reconnecting to Delta...");
-    deltaConnect();
-  }
-  if (deltaClient.connected()) {
-    // Zero all setpoints FIRST to prevent residual current flow
+
+  for (int attempt = 0; attempt < 3; attempt++) {
+    // Reconnect if needed - safety is more important than speed
+    if (!deltaClient.connected()) {
+      Serial.println("[DELTA] Quick OFF - reconnecting to Delta...");
+      if (!deltaConnect()) {
+        Serial.println("[DELTA] Quick OFF - connect FAILED, retrying...");
+        delay(200);
+        continue;
+      }
+    }
+
+    // CRITICAL SEQUENCE to prevent -1.64A sink:
+    // 1. Set voltage HIGH (above any battery) so Delta has no reason to sink
+    // 2. Zero all current limits
+    // 3. Turn output off
+    deltaClient.print("SOURce:VOLtage 5.00\r\n");  // Above any battery voltage
+    delay(100);
     deltaClient.print("SOURce:CURrent 0\r\n");
-    delay(80);
+    delay(100);
     deltaClient.print("SOURce:CURrent:NEGative 0\r\n");
-    delay(80);
+    delay(100);
     deltaClient.print("SOURce:POWer 0\r\n");
-    delay(80);
+    delay(100);
     deltaClient.print("SOURce:POWer:NEGative 0\r\n");
-    delay(80);
-    deltaClient.print("SOURce:VOLtage 0\r\n");
-    delay(80);
-    // NOW turn output off
+    delay(100);
     deltaClient.print("OUTPut OFF\r\n");
-    deltaClient.flush();
-    delay(300);  // Give Delta time to process before closing TCP
-    Serial.println("[DELTA] Quick OFF - commands sent OK");
-  } else {
-    Serial.println("[DELTA] Quick OFF - FAILED to reach Delta!");
+    delay(200);
+    // Set voltage to 0 AFTER output is off
+    deltaClient.print("SOURce:VOLtage 0\r\n");
+    delay(100);
+    deltaClient.print("OUTPut OFF\r\n");
+    delay(300);
+    yield();
+
+    // Verify: read current to check output is actually off
+    while(deltaClient.available()) deltaClient.read();  // drain
+    deltaClient.print("MEASure:CURrent?\r\n");
+    delay(100);
+    String iStr = "";
+    unsigned long start = millis();
+    while (millis() - start < 800) {
+      if (deltaClient.available()) {
+        char c = deltaClient.read();
+        if (c == '\n' || c == '\r') { if (iStr.length() > 0) break; }
+        else if (c >= 32 && c <= 126) iStr += c;
+      } else { delay(5); }
+      yield();
+    }
+
+    if (iStr.length() == 0) {
+      Serial.printf("[DELTA] Quick OFF attempt %d: no response (Delta not responding)\n", attempt + 1);
+      // No response = Delta SCPI not working, force reconnect and try again
+      deltaClient.stop();
+      status.deltaConnected = false;
+      delay(500);
+      continue;
+    }
+
+    float measI = iStr.toFloat();
+    Serial.printf("[DELTA] Quick OFF attempt %d: measured I=%.2fA\n", attempt + 1, measI);
+
+    // If current is near zero (< 0.5A), consider output off
+    if (fabs(measI) < 0.5) {
+      Serial.println("[DELTA] Quick OFF - VERIFIED: output is off");
+      return;  // Keep connection alive!
+    }
+
+    // Still drawing current - force reconnect and retry
+    Serial.printf("[DELTA] Quick OFF - STILL %.2fA! Retrying with fresh connection...\n", measI);
+    deltaClient.stop();
+    status.deltaConnected = false;
+    delay(500);
   }
-  deltaClient.stop();
-  status.deltaConnected = false;
+
+  Serial.println("[DELTA] Quick OFF - WARNING: could not verify output off after 3 attempts!");
 }
 
 void loop() {
-  // Handle web requests first - highest priority
+  // ============== CORE 1: Web server + Sensors + Logging ==============
+  // Delta communication is handled by Core 0 - this loop NEVER blocks on Delta!
+
+  // Handle web requests - always responsive now
   server.handleClient();
   yield();
 
   // Blue LED status indicator
-  // Fast blink (200ms) = running, slow blink (1000ms) = idle
   unsigned long blinkInterval = status.running ? 200 : 1000;
   if (millis() - lastLedToggle >= blinkInterval) {
     lastLedToggle = millis();
@@ -3161,129 +3386,55 @@ void loop() {
     digitalWrite(BLUE_LED_PIN, ledState ? HIGH : LOW);
   }
 
-  // Check for stop request - handle with minimal blocking
-  static bool stopInProgress = false;
-  if (stopRequested && !stopInProgress) {
-    stopInProgress = true;
-    Serial.println("[LOOP] Processing stop request...");
-
-    // Quick Delta off - don't wait for confirmation
-    quickDeltaOff();
-
-    // Reset ALL test states
-    status.running = false;
-    status.mode = MODE_IDLE;
-    sgsConfig.sgsTestActive = false;
-    sgsConfig.sgsCurrentPhase = 0;
-    whTest.active = false;
-    whTest.phase = 0;
-    stopRequested = false;
-    stopInProgress = false;
-
-    logSafetyEvent("STOP executed via loop");
-    beepStop();
-    Serial.println("[LOOP] Stop complete");
-    return;
-  }
-
-  // Read thermal camera
+  // Read thermal camera (Core 1 - I2C Wire1)
   if (mlxConnected) {
     mlxRead();
     yield();
   }
 
-  // Update test every 2 seconds (increased for slow Delta)
-  static unsigned long lastUpd = 0;
-  if (millis() - lastUpd >= 2000) {
-    lastUpd = millis();
-    if (status.running && !stopRequested) {
-      // SGS/Anorgion test has its own state machine with cutoff current detection
-      if (sgsConfig.sgsTestActive) {
-        // Read measurements for SGS mode
-        deltaReadMeasurements();
-        readTemp();
-        appendLogEntry();
-        yield();
-        updateSGSTest();
-      } else if (whTest.active) {
-        // Wh capacity test mode
-        deltaReadMeasurements();
-        readTemp();
-        appendLogEntry();
-        yield();
-        updateWhTest();
-      } else {
-        // Normal mode - updateTest handles everything
+  // Read temperature + log data when running
+  static unsigned long lastSensorRead = 0;
+  if (millis() - lastSensorRead >= 2000) {
+    lastSensorRead = millis();
+
+    readTemp();
+    yield();
+
+    // Log data when test is running and we have fresh measurements
+    if (status.running) {
+      appendLogEntry();
+      yield();
+
+      // Temperature safety checks (Core 1 has the temp data)
+      if (status.temperature > config.tempAlarm) {
+        status.lastError = "TEMP ALARM (DS18B20)";
+        stopRequested = true;
+        DeltaCmd cmd = {DCMD_STOP, 0, 0};
+        xQueueSend(deltaQueue, &cmd, 0);
+        beepFail();
+      }
+      if (mlxConnected && mlxMax > config.thermalAlarm) {
+        status.lastError = "THERMAL ALARM (MLX90640): " + String(mlxMax, 1) + "C";
+        stopRequested = true;
+        DeltaCmd cmd = {DCMD_STOP, 0, 0};
+        xQueueSend(deltaQueue, &cmd, 0);
+        beepFail();
+      }
+
+      // Cycle test: check for charge/discharge transition
+      if (status.mode == MODE_CYCLE && !sgsConfig.sgsTestActive && !whTest.active) {
         updateTest();
       }
-      yield();
     }
   }
 
   // Read temperature every 5 seconds when idle
-  static unsigned long lastTemp = 0;
-  if (millis() - lastTemp >= 5000) {
-    lastTemp = millis();
-    if (!status.running) {
-      readTemp();
-      yield();
-    }
+  static unsigned long lastIdleTemp = 0;
+  if (millis() - lastIdleTemp >= 5000 && !status.running) {
+    lastIdleTemp = millis();
+    readTemp();
   }
 
-  // Read Delta measurements when idle - ONE query per loop cycle to avoid blocking web server
-  // Spreads 3 queries (V, I, P) across 3 separate 2-second intervals
-  static unsigned long lastIdleDelta = 0;
-  static int idleQueryStep = 0;  // 0=voltage, 1=current, 2=power+safety
-  if (millis() - lastIdleDelta >= 2000) {
-    lastIdleDelta = millis();
-    if (!status.running && !stopRequested) {
-      if (deltaClient.connected() || deltaConnect()) {
-        server.handleClient();
-        yield();
-
-        if (idleQueryStep == 0) {
-          String vStr = deltaQuery("MEASure:VOLtage?");
-          if (vStr.length() > 0) {
-            float v = vStr.toFloat();
-            if (v >= 0 && v <= 100) status.voltage = v;
-          }
-          idleQueryStep = 1;
-        } else if (idleQueryStep == 1) {
-          String iStr = deltaQuery("MEASure:CURrent?");
-          if (iStr.length() > 0) status.current = iStr.toFloat();
-          idleQueryStep = 2;
-        } else {
-          String pStr = deltaQuery("MEASure:POWer?");
-          if (pStr.length() > 0) status.power = pStr.toFloat();
-          idleQueryStep = 0;
-
-          // IDLE SAFETY MONITOR: check after all 3 values are updated
-          float v = status.voltage;
-          float i = status.current;
-          if (v > 0.5 && v < HARD_MIN_VOLTAGE && i < -0.5) {
-            Serial.printf("\n!!! IDLE SAFETY: V=%.3fV < %.2fV while draining %.2fA !!!\n", v, HARD_MIN_VOLTAGE, i);
-            logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V I=" + String(i, 2) + "A");
-            quickDeltaOff();
-            delay(100);
-            quickDeltaOff();
-            status.lastError = "IDLE SAFETY: Battery below " + String(HARD_MIN_VOLTAGE, 2) + "V!";
-            beepFail();
-          }
-          if (v > HARD_MAX_VOLTAGE) {
-            Serial.printf("\n!!! IDLE SAFETY: V=%.3fV > %.2fV !!!\n", v, HARD_MAX_VOLTAGE);
-            logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V > max");
-            quickDeltaOff();
-            delay(100);
-            quickDeltaOff();
-            status.lastError = "IDLE SAFETY: Battery above " + String(HARD_MAX_VOLTAGE, 2) + "V!";
-            beepFail();
-          }
-        }
-      }
-      yield();
-    }
-  }
-
-  delay(10);
+  delay(5);  // Minimal delay - web server needs to be fast
   yield();
 }
