@@ -3230,50 +3230,45 @@ void loop() {
     }
   }
 
-  // Read Delta measurements every 5 seconds when idle (to keep display updated)
-  // Uses shorter timeout to avoid blocking web requests too long
+  // Read Delta measurements when idle - ONE query per loop cycle to avoid blocking web server
+  // Spreads 3 queries (V, I, P) across 3 separate 2-second intervals
   static unsigned long lastIdleDelta = 0;
-  if (millis() - lastIdleDelta >= 5000) {
+  static int idleQueryStep = 0;  // 0=voltage, 1=current, 2=power+safety
+  if (millis() - lastIdleDelta >= 2000) {
     lastIdleDelta = millis();
     if (!status.running && !stopRequested) {
-      // Quick single voltage read to check if Delta is responsive
       if (deltaClient.connected() || deltaConnect()) {
-        // Handle any pending web requests first
         server.handleClient();
         yield();
 
-        // Quick voltage query with shorter effective timeout (exit early on response)
-        String vStr = deltaQuery("MEASure:VOLtage?");
-        if (vStr.length() > 0) {
-          server.handleClient();
-          yield();
-          String iStr = deltaQuery("MEASure:CURrent?");
-          server.handleClient();
-          yield();
-          String pStr = deltaQuery("MEASure:POWer?");
-
-          float v = vStr.toFloat();
-          float i = iStr.toFloat();
-          float p = pStr.toFloat();
-          if (v >= 0 && v <= 100) {
-            status.voltage = v;
-            status.current = i;
-            status.power = p;
+        if (idleQueryStep == 0) {
+          String vStr = deltaQuery("MEASure:VOLtage?");
+          if (vStr.length() > 0) {
+            float v = vStr.toFloat();
+            if (v >= 0 && v <= 100) status.voltage = v;
           }
+          idleQueryStep = 1;
+        } else if (idleQueryStep == 1) {
+          String iStr = deltaQuery("MEASure:CURrent?");
+          if (iStr.length() > 0) status.current = iStr.toFloat();
+          idleQueryStep = 2;
+        } else {
+          String pStr = deltaQuery("MEASure:POWer?");
+          if (pStr.length() > 0) status.power = pStr.toFloat();
+          idleQueryStep = 0;
 
-          // IDLE SAFETY MONITOR: protect battery even when no test is running
-          // If voltage is dangerously low and current is negative (battery draining),
-          // emergency shutdown the Delta to prevent battery damage
+          // IDLE SAFETY MONITOR: check after all 3 values are updated
+          float v = status.voltage;
+          float i = status.current;
           if (v > 0.5 && v < HARD_MIN_VOLTAGE && i < -0.5) {
             Serial.printf("\n!!! IDLE SAFETY: V=%.3fV < %.2fV while draining %.2fA !!!\n", v, HARD_MIN_VOLTAGE, i);
             logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V I=" + String(i, 2) + "A");
             quickDeltaOff();
             delay(100);
-            quickDeltaOff();  // Double-tap for safety
+            quickDeltaOff();
             status.lastError = "IDLE SAFETY: Battery below " + String(HARD_MIN_VOLTAGE, 2) + "V!";
             beepFail();
           }
-          // Also protect against overvoltage while idle
           if (v > HARD_MAX_VOLTAGE) {
             Serial.printf("\n!!! IDLE SAFETY: V=%.3fV > %.2fV !!!\n", v, HARD_MAX_VOLTAGE);
             logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V > max");
