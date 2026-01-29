@@ -48,8 +48,10 @@ const int DELTA_PORT = 8462;
 #define ONE_WIRE_BUS 13
 #define PA_ENABLE_PIN   21
 #define BLUE_LED_PIN    22  // Blue LED on ESP32-LyraT
-#define I2C_SDA_PIN     18
-#define I2C_SCL_PIN     23
+#define I2C_SDA_PIN     18  // ES8311 audio codec (hardwired on LyraT)
+#define I2C_SCL_PIN     23  // ES8311 audio codec (hardwired on LyraT)
+#define MLX_SDA_PIN     15  // MLX90640 thermal camera (Wire1)
+#define MLX_SCL_PIN     14  // MLX90640 thermal camera (Wire1)
 #define ES8311_ADDR     0x18
 #define SAMPLE_RATE     16000
 #define I2S_NUM         I2S_NUM_0
@@ -202,7 +204,7 @@ struct {
 bool mlxInit() {
   Serial.println("[MLX] Initializing...");
 
-  if (!mlxSensor.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
+  if (!mlxSensor.begin(MLX90640_I2CADDR_DEFAULT, &Wire1)) {
     Serial.println("[MLX] Not found on I2C");
     return false;
   }
@@ -675,6 +677,46 @@ bool deltaSetupDischarge(float voltage, float current) {
   return true;
 }
 
+// Hot-update charge parameters without cycling output (live adjustment)
+bool deltaUpdateChargeParams(float voltage, float current) {
+  Serial.printf("[DELTA] LIVE UPDATE CHARGE: %.2fV %.1fA\n", voltage, current);
+
+  if (!deltaClient.connected()) {
+    if (!deltaConnect()) return false;
+  }
+
+  deltaSet("SOURce:VOLtage " + String(voltage, 2));
+  yield();
+  deltaSet("SOURce:CURrent " + String(current, 2));
+  yield();
+  float power = voltage * current * 1.5;
+  deltaSet("SOURce:POWer " + String(power, 0));
+  yield();
+
+  Serial.printf("[DELTA] Live update done: %.2fV %.1fA\n", voltage, current);
+  return true;
+}
+
+// Hot-update discharge parameters without cycling output (live adjustment)
+bool deltaUpdateDischargeParams(float voltage, float current) {
+  Serial.printf("[DELTA] LIVE UPDATE DISCHARGE: %.2fV %.1fA\n", voltage, current);
+
+  if (!deltaClient.connected()) {
+    if (!deltaConnect()) return false;
+  }
+
+  deltaSet("SOURce:VOLtage " + String(voltage, 2));
+  yield();
+  deltaSet("SOURce:CURrent:NEGative -" + String(current, 2));
+  yield();
+  float power = 70.0 * current * 1.5;
+  deltaSet("SOURce:POWer:NEGative -" + String(power, 0));
+  yield();
+
+  Serial.printf("[DELTA] Live update done: %.2fV %.1fA\n", voltage, current);
+  return true;
+}
+
 bool deltaReadMeasurements() {
   // Check stop FIRST
   if (stopRequested) return false;
@@ -848,17 +890,28 @@ void deltaStop() {
   for (int attempt = 0; attempt < 3; attempt++) {
     yield();
     if (deltaClient.connected() || deltaConnect()) {
+      // Zero setpoints first to prevent residual current
+      deltaClient.print("SOURce:CURrent 0\n");
+      delay(30);
+      deltaClient.print("SOURce:CURrent:NEGative 0\n");
+      delay(30);
+      deltaClient.print("SOURce:POWer 0\n");
+      delay(30);
+      deltaClient.print("SOURce:POWer:NEGative 0\n");
+      delay(30);
+      deltaClient.print("SOURce:VOLtage 0\n");
+      delay(30);
       deltaClient.print("OUTPut OFF\n");
       deltaClient.flush();
       delay(200);
       yield();
-      Serial.printf("[DELTA] Stop attempt %d sent\n", attempt + 1);
+      Serial.printf("[DELTA] Stop attempt %d sent (with zero setpoints)\n", attempt + 1);
     }
   }
 
   deltaClient.stop();
   status.deltaConnected = false;
-  Serial.println("[DELTA] Output disabled, connection closed");
+  Serial.println("[DELTA] Output disabled, setpoints zeroed, connection closed");
 }
 
 String deltaPing() {
@@ -2276,6 +2329,17 @@ void handleCharge() {
     return;
   }
 
+  // Live update if already charging - adjust Delta without stopping
+  if (status.running && status.mode == MODE_CHARGE) {
+    logSafetyEvent("CHARGE LIVE UPDATE: V=" + String(v,2) + " I=" + String(i,1));
+    if (deltaUpdateChargeParams(v, i)) {
+      server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Parameters updated live\"}");
+    } else {
+      server.send(500, "application/json", "{\"ok\":false,\"error\":\"Delta live update failed\"}");
+    }
+    return;
+  }
+
   logSafetyEvent("CHARGE STARTED: V=" + String(v,2) + " I=" + String(i,1));
   startCharge(v, i);
   server.send(200, "application/json", "{\"ok\":true}");
@@ -2291,6 +2355,17 @@ void handleDischarge() {
     logSafetyEvent("DISCHARGE BLOCKED: " + error + " (V=" + String(v,2) + " I=" + String(i,1) + ")");
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + error + "\"}");
     beepFail();
+    return;
+  }
+
+  // Live update if already discharging - adjust Delta without stopping
+  if (status.running && status.mode == MODE_DISCHARGE) {
+    logSafetyEvent("DISCHARGE LIVE UPDATE: V=" + String(v,2) + " I=" + String(i,1));
+    if (deltaUpdateDischargeParams(v, i)) {
+      server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Parameters updated live\"}");
+    } else {
+      server.send(500, "application/json", "{\"ok\":false,\"error\":\"Delta live update failed\"}");
+    }
     return;
   }
 
@@ -2822,12 +2897,14 @@ void setup() {
   digitalWrite(BLUE_LED_PIN, LOW);
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(400000);  // 400kHz for MLX90640
+  Wire.setClock(100000);  // 100kHz for ES8311
 
   es8311_init();
   i2s_init();
 
-  // Initialize MLX90640
+  // Initialize MLX90640 on separate I2C bus (Wire1, GPIO 15/14)
+  Wire1.begin(MLX_SDA_PIN, MLX_SCL_PIN);
+  Wire1.setClock(400000);  // 400kHz for MLX90640
   mlxConnected = mlxInit();
   if (mlxConnected) {
     Serial.println("[MLX] Thermal camera ready!");
@@ -3004,11 +3081,23 @@ void updateSGSTest() {
 
 // Quick Delta off - minimal blocking
 void quickDeltaOff() {
-  Serial.println("[DELTA] Quick OFF - single attempt");
+  Serial.println("[DELTA] Quick OFF - zeroing setpoints + output off");
   if (deltaClient.connected()) {
+    // Zero all setpoints FIRST to prevent residual current flow
+    deltaClient.print("SOURce:CURrent 0\n");
+    delay(50);
+    deltaClient.print("SOURce:CURrent:NEGative 0\n");
+    delay(50);
+    deltaClient.print("SOURce:POWer 0\n");
+    delay(50);
+    deltaClient.print("SOURce:POWer:NEGative 0\n");
+    delay(50);
+    deltaClient.print("SOURce:VOLtage 0\n");
+    delay(50);
+    // NOW turn output off
     deltaClient.print("OUTPut OFF\n");
     deltaClient.flush();
-    delay(100);
+    delay(300);  // Give Delta time to process before closing TCP
   }
   deltaClient.stop();
   status.deltaConnected = false;
@@ -3126,6 +3215,29 @@ void loop() {
             status.voltage = v;
             status.current = i;
             status.power = p;
+          }
+
+          // IDLE SAFETY MONITOR: protect battery even when no test is running
+          // If voltage is dangerously low and current is negative (battery draining),
+          // emergency shutdown the Delta to prevent battery damage
+          if (v > 0.5 && v < HARD_MIN_VOLTAGE && i < -0.5) {
+            Serial.printf("\n!!! IDLE SAFETY: V=%.3fV < %.2fV while draining %.2fA !!!\n", v, HARD_MIN_VOLTAGE, i);
+            logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V I=" + String(i, 2) + "A");
+            quickDeltaOff();
+            delay(100);
+            quickDeltaOff();  // Double-tap for safety
+            status.lastError = "IDLE SAFETY: Battery below " + String(HARD_MIN_VOLTAGE, 2) + "V!";
+            beepFail();
+          }
+          // Also protect against overvoltage while idle
+          if (v > HARD_MAX_VOLTAGE) {
+            Serial.printf("\n!!! IDLE SAFETY: V=%.3fV > %.2fV !!!\n", v, HARD_MAX_VOLTAGE);
+            logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V > max");
+            quickDeltaOff();
+            delay(100);
+            quickDeltaOff();
+            status.lastError = "IDLE SAFETY: Battery above " + String(HARD_MAX_VOLTAGE, 2) + "V!";
+            beepFail();
           }
         }
       }
