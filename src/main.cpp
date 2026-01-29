@@ -520,10 +520,10 @@ bool deltaConnect() {
 
   // Only stop if we need to reconnect
   deltaClient.stop();
-  delay(200);
+  delay(100);
   yield();
 
-  deltaClient.setTimeout(10);
+  deltaClient.setTimeout(2);  // 2 sec timeout - don't block webserver
   if (!deltaClient.connect(DELTA_IP, DELTA_PORT)) {
     Serial.println("[DELTA] Connect FAILED");
     status.deltaConnected = false;
