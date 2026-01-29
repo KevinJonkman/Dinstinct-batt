@@ -3082,6 +3082,11 @@ void updateSGSTest() {
 // Quick Delta off - minimal blocking
 void quickDeltaOff() {
   Serial.println("[DELTA] Quick OFF - zeroing setpoints + output off");
+  // Reconnect if needed - safety is more important than speed
+  if (!deltaClient.connected()) {
+    Serial.println("[DELTA] Quick OFF - reconnecting to Delta...");
+    deltaConnect();
+  }
   if (deltaClient.connected()) {
     // Zero all setpoints FIRST to prevent residual current flow
     deltaClient.print("SOURce:CURrent 0\n");
@@ -3098,6 +3103,9 @@ void quickDeltaOff() {
     deltaClient.print("OUTPut OFF\n");
     deltaClient.flush();
     delay(300);  // Give Delta time to process before closing TCP
+    Serial.println("[DELTA] Quick OFF - commands sent OK");
+  } else {
+    Serial.println("[DELTA] Quick OFF - FAILED to reach Delta!");
   }
   deltaClient.stop();
   status.deltaConnected = false;
