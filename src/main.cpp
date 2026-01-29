@@ -1,14 +1,14 @@
 /*
- * Battery Tester v7.5 - HARD SAFETY LIMITS
+ * Battery Tester v7.5 - HARD SAFETY LIMITS + REMOTE SENSOR
  * Based on v7.3 + CRITICAL safety fixes:
  * - Fixed SCPI response truncation (was cutting off at 4 chars)
  * - Added HARD voltage limits: IMMEDIATE stop if V < 2.70V or V > 4.15V
  * - Fixed discharge cutoff: stops on voltage OR current, not both
+ * - Removed local MLX90640/DS18B20 - temperature via remote sensor board
  *
  * Hardware:
  * - ESP32 LyraT v1.2
- * - DS18B20 temp sensor on GPIO13
- * - MLX90640 thermal camera on I2C (GPIO18/23)
+ * - Remote sensor board (second LyraT at 192.168.1.24) for temperature
  * - Delta SM70-CP-450 power supply via TCP
  *
  * Safety Features:
@@ -20,8 +20,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
 #include <Wire.h>
 #include <driver/i2s.h>
 #include <Preferences.h>
@@ -34,8 +32,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
-// Adafruit MLX90640 library
-#include <Adafruit_MLX90640.h>
+// HTTPClient removed - too heavy on memory. Using raw WiFiClient instead.
 
 // Data logging settings
 #define LOG_FILE "/datalog.csv"
@@ -50,14 +47,12 @@ const char* WIFI_SSID = "BTAC Medewerkers";
 const char* WIFI_PASS = "Next3600$!";
 const char* DELTA_IP = "192.168.1.16";
 const int DELTA_PORT = 8462;
+const char* REMOTE_SENSOR_IP = "192.168.1.24";  // Second LyraT sensor board
 
-#define ONE_WIRE_BUS 13
 #define PA_ENABLE_PIN   21
 #define BLUE_LED_PIN    22  // Blue LED on ESP32-LyraT
 #define I2C_SDA_PIN     18  // ES8311 audio codec (hardwired on LyraT)
 #define I2C_SCL_PIN     23  // ES8311 audio codec (hardwired on LyraT)
-#define MLX_SDA_PIN     15  // MLX90640 thermal camera (Wire1)
-#define MLX_SCL_PIN     14  // MLX90640 thermal camera (Wire1)
 #define ES8311_ADDR     0x18
 #define SAMPLE_RATE     16000
 #define I2S_NUM         I2S_NUM_0
@@ -69,8 +64,6 @@ const int DELTA_PORT = 8462;
 
 WebServer server(80);
 WiFiClient deltaClient;
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature tempSensor(&oneWire);
 Preferences prefs;
 
 volatile bool stopRequested = false;
@@ -105,12 +98,27 @@ volatile bool deltaTaskReady = false;
 volatile bool deltaCommandBusy = false;  // True while Delta task processes a command
 volatile unsigned long lastDeltaMeasureTime = 0;  // When Core 0 last read measurements
 
+// Delta connection backoff - prevents blocking Core 0 (and WiFi stack) with repeated connect attempts
+int deltaConnectFails = 0;                  // Consecutive connection failures
+unsigned long deltaNextConnectAllowed = 0;  // millis() when next connect attempt is allowed
+unsigned long deltaBackoffMs = 0;           // Current backoff delay in ms
+
 // Blue LED status indicator
 unsigned long lastLedToggle = 0;
 bool ledState = false;
 
+// Remote sensor board (second LyraT) temperatures
+float remoteDsTemp1 = -127.0;
+float remoteDsTemp2 = -127.0;
+float remoteMlxMax = 0;
+float remoteMlxAvg = 0;
+bool remoteSensorOnline = false;
+unsigned long lastRemoteFetch = 0;
+#define REMOTE_FETCH_INTERVAL_MS 5000
+
 // Forward declarations
 void quickDeltaOff();
+void deltaRestHold();
 void deltaTask(void* param);
 void updateSGSTest();
 void updateWhTest();
@@ -123,17 +131,6 @@ void beepStart();
 void beepStop();
 void beepFail();
 void beepDone();
-
-// MLX90640 variables
-Adafruit_MLX90640 mlxSensor;
-#define MLX_COLS 32
-#define MLX_ROWS 24
-#define MLX_PIXELS (MLX_COLS * MLX_ROWS)
-float mlxFrame[MLX_PIXELS];
-float mlxMin = 0, mlxMax = 0, mlxAvg = 0;
-bool mlxConnected = false;
-unsigned long lastMlxRead = 0;
-#define MLX_REFRESH_MS 500  // Read thermal every 500ms
 
 enum TestMode { MODE_IDLE, MODE_CHARGE, MODE_DISCHARGE, MODE_CYCLE };
 
@@ -247,59 +244,6 @@ struct {
   float currentCycleWhDischarge = 0;
 } sgsConfig;
 
-// ============== MLX90640 THERMAL CAMERA ==============
-
-bool mlxInit() {
-  Serial.println("[MLX] Initializing...");
-
-  if (!mlxSensor.begin(MLX90640_I2CADDR_DEFAULT, &Wire1)) {
-    Serial.println("[MLX] Not found on I2C");
-    return false;
-  }
-
-  // Set to 4Hz refresh rate (good balance)
-  mlxSensor.setRefreshRate(MLX90640_4_HZ);
-
-  // Set to chess pattern for better accuracy
-  mlxSensor.setMode(MLX90640_CHESS);
-
-  // Set resolution
-  mlxSensor.setResolution(MLX90640_ADC_18BIT);
-
-  Serial.println("[MLX] Initialized OK - 32x24 @ 4Hz");
-  return true;
-}
-
-void mlxRead() {
-  if (!mlxConnected) return;
-  if (millis() - lastMlxRead < MLX_REFRESH_MS) return;
-  lastMlxRead = millis();
-
-  if (mlxSensor.getFrame(mlxFrame) != 0) {
-    return;  // Error reading frame
-  }
-
-  // Calculate min/max/avg
-  mlxMin = 1000;
-  mlxMax = -40;
-  float sum = 0;
-  int validCount = 0;
-
-  for (int i = 0; i < MLX_PIXELS; i++) {
-    float t = mlxFrame[i];
-    if (t > -40 && t < 300) {  // Valid range
-      if (t < mlxMin) mlxMin = t;
-      if (t > mlxMax) mlxMax = t;
-      sum += t;
-      validCount++;
-    }
-  }
-
-  if (validCount > 0) {
-    mlxAvg = sum / validCount;
-  }
-}
-
 // ============== DATA LOGGING ==============
 unsigned long lastLogWrite = 0;
 bool loggingEnabled = false;
@@ -327,7 +271,7 @@ void startNewLog() {
   // Create new log file with header
   File f = SPIFFS.open(LOG_FILE, FILE_WRITE);
   if (f) {
-    f.println("timestamp,voltage,current,power,temp_ds18b20,temp_thermal_max,mode,ah_charge,ah_discharge,wh");
+    f.println("timestamp,voltage,current,power,temp_remote_t1,temp_remote_mlx_max,mode,ah_charge,ah_discharge,wh");
     f.close();
     loggingEnabled = true;
     Serial.println("[LOG] New log started");
@@ -362,7 +306,7 @@ void appendLogEntry() {
   // Write CSV line
   f.printf("%lu,%.4f,%.3f,%.2f,%.2f,%.2f,%s,%.4f,%.4f,%.3f\n",
     elapsed, status.voltage, status.current, status.power,
-    status.temperature, mlxMax, modeStr,
+    status.temperature, remoteMlxMax, modeStr,
     status.totalAhCharge, status.totalAhDischarge, status.totalWh);
   f.close();
 }
@@ -565,29 +509,41 @@ bool deltaConnect() {
     return true;
   }
 
+  // BACKOFF: Don't attempt connect if we're in backoff period
+  // This prevents blocking Core 0 (and WiFi TCP/IP stack!) with repeated failed connects
+  if (deltaConnectFails > 0 && millis() < deltaNextConnectAllowed) {
+    return false;  // Silent fail - not time to retry yet
+  }
+
   // Only stop if we need to reconnect
   deltaClient.stop();
-  delay(100);
+  delay(50);
   yield();
 
-  deltaClient.setTimeout(2);  // 2 sec timeout - don't block webserver
+  deltaClient.setTimeout(1);  // 1 sec timeout - minimize Core 0 blocking
   if (!deltaClient.connect(DELTA_IP, DELTA_PORT)) {
-    Serial.println("[DELTA] Connect FAILED");
+    deltaConnectFails++;
+    // Exponential backoff: 2s, 5s, 10s, 20s, 30s max
+    deltaBackoffMs = min(30000UL, (unsigned long)(2000 * (1 << min(deltaConnectFails - 1, 4))));
+    deltaNextConnectAllowed = millis() + deltaBackoffMs;
+    if (deltaConnectFails <= 3 || deltaConnectFails % 10 == 0) {
+      Serial.printf("[DELTA] Connect FAILED (%d fails, next retry in %lus)\n", deltaConnectFails, deltaBackoffMs / 1000);
+    }
     status.deltaConnected = false;
     return false;
   }
 
   status.deltaConnected = true;
-  delay(300);  // Give Delta time to be ready
+  delay(200);  // Give Delta time to be ready
   yield();
   while(deltaClient.available()) deltaClient.read();
 
   // Health check: verify SCPI is responsive
   deltaClient.print("*IDN?\r\n");
-  delay(100);
+  delay(80);
   String idn = "";
   unsigned long start = millis();
-  while (millis() - start < 1000) {
+  while (millis() - start < 800) {
     if (deltaClient.available()) {
       char c = deltaClient.read();
       if (c == '\n' || c == '\r') { if (idn.length() > 0) break; }
@@ -597,23 +553,34 @@ bool deltaConnect() {
   }
 
   if (idn.length() > 0) {
+    // SUCCESS - reset backoff
+    deltaConnectFails = 0;
+    deltaBackoffMs = 0;
+    deltaNextConnectAllowed = 0;
     Serial.printf("[DELTA] Connected OK - %s\n", idn.c_str());
     return true;
   }
 
-  // SCPI not responding - connection is useless
-  Serial.println("[DELTA] Connected but SCPI NOT RESPONDING! Delta may need power cycle.");
+  // SCPI not responding - connection is useless, count as failure for backoff
+  deltaConnectFails++;
+  deltaBackoffMs = min(30000UL, (unsigned long)(2000 * (1 << min(deltaConnectFails - 1, 4))));
+  deltaNextConnectAllowed = millis() + deltaBackoffMs;
+  Serial.printf("[DELTA] SCPI NOT RESPONDING (%d fails, next retry in %lus)\n", deltaConnectFails, deltaBackoffMs / 1000);
   status.lastError = "Delta SCPI not responding - power cycle Delta!";
   deltaClient.stop();
   status.deltaConnected = false;
   return false;
 }
 
-// Force reconnect - only use when you explicitly need a fresh connection
+// Force reconnect - resets backoff and forces immediate attempt
 bool deltaForceReconnect() {
   deltaClient.stop();
   delay(200);
   status.deltaConnected = false;
+  // Reset backoff so we try immediately
+  deltaConnectFails = 0;
+  deltaBackoffMs = 0;
+  deltaNextConnectAllowed = 0;
   return deltaConnect();
 }
 
@@ -960,8 +927,8 @@ bool deltaReadMeasurements() {
       if (status.temperature > status.peakTempThisCycle) {
         status.peakTempThisCycle = status.temperature;
       }
-      if (mlxConnected && mlxMax > status.peakTempThisCycle) {
-        status.peakTempThisCycle = mlxMax;
+      if (remoteSensorOnline && remoteMlxMax > status.peakTempThisCycle) {
+        status.peakTempThisCycle = remoteMlxMax;
       }
     }
     status.lastMeasureTime = millis();
@@ -1004,13 +971,6 @@ String deltaPing() {
 
   beepFail();
   return "FAIL: No response";
-}
-
-// ============== TEMPERATURE ==============
-void readTemp() {
-  tempSensor.requestTemperatures();
-  float t = tempSensor.getTempCByIndex(0);
-  if (t > -50 && t < 100 && t != 85.0) status.temperature = t;
 }
 
 // ============== TEST CONTROL ==============
@@ -1168,7 +1128,7 @@ void updateTest() {
     else if (status.mode == MODE_DISCHARGE) modeChar = 'D';
     else if (status.mode == MODE_CYCLE) modeChar = status.current >= 0 ? 'C' : 'D';
     Serial.printf("[%c] V=%.3f I=%.2f T=%.1f TH=%.1f AhC=%.3f AhD=%.3f\n",
-      modeChar, status.voltage, status.current, status.temperature, mlxMax,
+      modeChar, status.voltage, status.current, status.temperature, remoteMlxMax,
       status.totalAhCharge, status.totalAhDischarge);
   }
 
@@ -1237,32 +1197,6 @@ void updateTest() {
 
 // ============== WEB SERVER ==============
 
-// Color gradient for thermal image (blue -> green -> yellow -> red)
-String getThermalColor(float temp, float minT, float maxT) {
-  if (maxT <= minT) maxT = minT + 1;
-  float ratio = (temp - minT) / (maxT - minT);
-  ratio = constrain(ratio, 0.0, 1.0);
-
-  int r, g, b;
-  if (ratio < 0.25) {
-    float t = ratio / 0.25;
-    r = 0; g = (int)(255 * t); b = 255;
-  } else if (ratio < 0.5) {
-    float t = (ratio - 0.25) / 0.25;
-    r = 0; g = 255; b = (int)(255 * (1 - t));
-  } else if (ratio < 0.75) {
-    float t = (ratio - 0.5) / 0.25;
-    r = (int)(255 * t); g = 255; b = 0;
-  } else {
-    float t = (ratio - 0.75) / 0.25;
-    r = 255; g = (int)(255 * (1 - t)); b = 0;
-  }
-
-  char hex[8];
-  sprintf(hex, "#%02X%02X%02X", r, g, b);
-  return String(hex);
-}
-
 // Helper function to send HTML page with chunked transfer
 // This prevents browser timeout by sending headers immediately
 void sendChunkedPage(const String& content) {
@@ -1298,12 +1232,6 @@ void sendMainPage() {
   h += ".panel{background:#16213e;border-radius:6px;padding:12px;margin-bottom:10px}";
   h += ".panel h2{color:#0cf;font-size:0.9em;margin-bottom:8px}";
   h += ".graph-container{height:300px;position:relative}";
-  h += ".thermal-container{text-align:center}";
-  h += ".thermal-img{image-rendering:pixelated;border:2px solid #333;border-radius:4px;max-width:100%}";
-  h += ".thermal-stats{display:flex;justify-content:space-around;margin-top:8px}";
-  h += ".thermal-stat{text-align:center}.thermal-stat .label{font-size:0.7em;color:#888}";
-  h += ".thermal-stat .val{font-size:1.1em;font-weight:bold}";
-  h += ".tmin{color:#00f}.tmax{color:#f00}.tavg{color:#0f0}";
   // 7-segment display styles
   h += ".seg-display{display:flex;gap:20px;justify-content:center;margin-bottom:15px;flex-wrap:wrap}";
   h += ".seg-box{background:#0a0a15;border:2px solid #333;border-radius:8px;padding:15px 25px;text-align:center;min-width:180px}";
@@ -1336,13 +1264,19 @@ void sendMainPage() {
   h += "<div class='st' id='st'>Loading...</div>";
   h += "<div class='err' id='err' style='display:none'></div>";
 
-  // Large 7-segment displays for Voltage, Current, Temp and Elapsed Time
+  // Row 1: Voltage, Current, Elapsed Time
   h += "<div class='seg-display'>";
   h += "<div class='seg-box'><div class='seg-label'>Voltage</div><div class='seg-value voltage' id='vBig'>--.---<span class='seg-unit'>V</span></div></div>";
   h += "<div class='seg-box'><div class='seg-label'>Current</div><div class='seg-value current' id='iBig'>--.--<span class='seg-unit'>A</span></div></div>";
-  h += "<div class='seg-box'><div class='seg-label'>Temp DS18B20</div><div class='seg-value' id='tBig'>--.-<span class='seg-unit'>°C</span></div></div>";
-  h += "<div class='seg-box' style='border-color:#f80'><div class='seg-label'>Thermal Avg</div><div class='seg-value' id='tAvgBig' style='color:#f80;text-shadow:0 0 10px #f80'>--.-<span class='seg-unit'>°C</span></div></div>";
   h += "<div class='seg-box' style='border-color:#c80'><div class='seg-label'>Elapsed Time</div><div class='seg-value' id='elapsed' style='color:#c80;text-shadow:0 0 10px #c80'>00:00:00</div></div>";
+  h += "</div>";
+
+  // Row 2: All 4 remote temperatures
+  h += "<div class='seg-display'>";
+  h += "<div class='seg-box' style='border-color:#0a6'><div class='seg-label'>Temp 1 <span id='rSt' style='font-size:0.7em'>--</span></div><div class='seg-value' id='tBig' style='color:#0f0;text-shadow:0 0 10px #0f0'>--.-<span class='seg-unit'>°C</span></div></div>";
+  h += "<div class='seg-box' style='border-color:#0a6'><div class='seg-label'>Temp 2</div><div class='seg-value' id='tAvgBig' style='color:#0f0;text-shadow:0 0 10px #0f0'>--.-<span class='seg-unit'>°C</span></div></div>";
+  h += "<div class='seg-box' style='border-color:#f80'><div class='seg-label'>Thermal Max</div><div class='seg-value' id='rMlxBig' style='color:#f80;text-shadow:0 0 10px #f80'>--.-<span class='seg-unit'>°C</span></div></div>";
+  h += "<div class='seg-box' style='border-color:#f44'><div class='seg-label'>Thermal Avg</div><div class='seg-value' id='rMlxAvgBig' style='color:#fa0;text-shadow:0 0 8px #fa0'>--.-<span class='seg-unit'>°C</span></div></div>";
   h += "</div>";
 
   // Smaller status cards
@@ -1415,25 +1349,9 @@ void sendMainPage() {
   h += "</div></div>";
   h += "</div>";
 
-  // Main grid: Graph left, Thermal right
-  h += "<div class='main-grid'>";
-
-  // Left: Graph
+  // Graph panel (full width)
   h += "<div class='panel'><h2>Real-time Data</h2>";
   h += "<div class='graph-container'><canvas id='chart'></canvas></div></div>";
-
-  // Right: Thermal
-  h += "<div class='panel'><h2>Thermal Camera</h2>";
-  h += "<div id='mlxStatus'>Checking...</div>";
-  h += "<div class='thermal-container' id='thermalContainer' style='display:none'>";
-  h += "<canvas id='thermal' class='thermal-img' width='320' height='240'></canvas>";
-  h += "<div class='thermal-stats'>";
-  h += "<div class='thermal-stat'><div class='label'>MIN</div><div class='val tmin' id='tmin'>--</div></div>";
-  h += "<div class='thermal-stat'><div class='label'>MAX</div><div class='val tmax' id='tmax'>--</div></div>";
-  h += "<div class='thermal-stat'><div class='label'>AVG</div><div class='val tavg' id='tavg'>--</div></div>";
-  h += "</div></div></div>";
-
-  h += "</div>"; // end main-grid
 
   // Controls row
   h += "<div class='controls'>";
@@ -1500,21 +1418,20 @@ void sendMainPage() {
   h += "chart.update();}";
   h += "function clearChart(){labels.length=0;vData.length=0;iData.length=0;tData.length=0;chart.update();}";
 
-  // Thermal canvas
-  h += "var tCanvas=$('thermal'),tCtx=tCanvas.getContext('2d');";
-
   // Helper function to format seconds as HH:MM:SS
   h += "function fmtTime(s){var h=Math.floor(s/3600);var m=Math.floor((s%3600)/60);var sec=s%60;";
   h += "return (h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(sec<10?'0':'')+sec;}";
 
+  // Fetch with retry - silently retries once before failing
+  h += "function fetchR(url,n){n=n||0;return fetch(url).then(r=>{if(!r.ok)throw'err';return r.json();}).catch(e=>{if(n<2)return new Promise(r=>setTimeout(r,300)).then(()=>fetchR(url,n+1));throw e;})}";
   // Update function
-  h += "function upd(){fetch('/status').then(r=>r.json()).then(d=>{";
+  h += "function upd(){fetchR('/status').then(d=>{";
   // 7-segment displays
   h += "$('vBig').innerHTML=d.v.toFixed(3)+'<span class=\"seg-unit\">V</span>';";
   h += "var iEl=$('iBig');iEl.innerHTML=d.i.toFixed(2)+'<span class=\"seg-unit\">A</span>';";
   h += "iEl.className='seg-value current'+(d.i<0?' negative':'');";
-  h += "$('tBig').innerHTML=d.t.toFixed(1)+'<span class=\"seg-unit\">°C</span>';";
-  h += "if(d.mlx)$('tAvgBig').innerHTML=d.mlxAvg.toFixed(1)+'<span class=\"seg-unit\">°C</span>';";
+  h += "$('tBig').innerHTML=(d.remoteOnline&&d.remoteT1>-100?d.remoteT1.toFixed(1):'--.-')+'<span class=\"seg-unit\">°C</span>';";
+  h += "$('tAvgBig').innerHTML=(d.remoteOnline&&d.remoteT2>-100?d.remoteT2.toFixed(1):'--.-')+'<span class=\"seg-unit\">°C</span>';";
   // Elapsed time display
   h += "$('elapsed').innerText=fmtTime(d.elapsed||0);";
   // Cards
@@ -1523,6 +1440,14 @@ void sendMainPage() {
   h += "$('wh').innerText=d.wh.toFixed(2);";
   h += "$('pwr').innerText=d.p.toFixed(1)+'W';";
   h += "$('cyc').innerText=d.cyc+'/'+d.ncyc;";
+  // Remote sensor board - update seg-box displays
+  h += "if(d.remoteOnline){$('rSt').innerText='ONLINE';$('rSt').style.color='#0f0';";
+  h += "$('rMlxBig').innerHTML=d.remoteMlxMax.toFixed(1)+'<span class=\"seg-unit\">°C</span>';";
+  h += "$('rMlxAvgBig').innerHTML=(d.remoteMlxAvg||0).toFixed(1)+'<span class=\"seg-unit\">°C</span>';";
+  h += "}else{$('rSt').innerText='OFFLINE';$('rSt').style.color='#f44';";
+  h += "$('rMlxBig').innerHTML='--.-<span class=\"seg-unit\">°C</span>';";
+  h += "$('rMlxAvgBig').innerHTML='--.-<span class=\"seg-unit\">°C</span>';}";
+
   // Cycle panel - show only during cycle mode (mode 3)
   h += "var cp=$('cyclePanel');";
   h += "if(d.mode==3){cp.style.display='block';";
@@ -1585,27 +1510,12 @@ void sendMainPage() {
   h += "else{ct.innerText='Constant Current Mode';ct.style.color='#f80';}";
   // Chart data
   h += "addData(d.v,d.i,d.t);";
-  // Thermal camera
-  h += "if(d.mlx){";
-  h += "$('mlxStatus').style.display='none';$('thermalContainer').style.display='block';";
-  h += "$('tmin').innerText=d.mlxMin.toFixed(1)+'C';";
-  h += "$('tmax').innerText=d.mlxMax.toFixed(1)+'C';";
-  h += "$('tavg').innerText=d.mlxAvg.toFixed(1)+'C';";
-  h += "}else{$('mlxStatus').innerText='MLX90640 not connected';$('thermalContainer').style.display='none';}";
-  h += "}).catch(()=>{$('st').innerText='ESP Offline';$('st').className='st off';})}";
+  h += "}).catch(()=>{})}";  // Silent fail after retries - next poll will update
 
   // Log info update
-  h += "function updLog(){fetch('/loginfo').then(r=>r.json()).then(d=>{";
+  h += "function updLog(){fetchR('/loginfo').then(d=>{";
   h += "var kb=(d.logSize/1024).toFixed(1);var free=(d.freeSpace/1024).toFixed(0);";
   h += "$('logInfo').innerText='Size: '+kb+'KB | Free: '+free+'KB'+(d.logging?' | Recording...':'');";
-  h += "}).catch(()=>{})}";
-
-  // Thermal update
-  h += "function updThermal(){var tc=$('thermalContainer');if(!tc||tc.style.display=='none')return;";
-  h += "fetch('/thermaldata').then(r=>r.json()).then(d=>{";
-  h += "if(!d.data)return;var w=32,h=24,scale=10;";
-  h += "for(var y=0;y<h;y++){for(var x=0;x<w;x++){";
-  h += "tCtx.fillStyle=d.colors[y*w+x];tCtx.fillRect(x*scale,y*scale,scale,scale);}}";
   h += "}).catch(()=>{})}";
 
   // Safety limits (loaded from server)
@@ -1645,7 +1555,7 @@ void sendMainPage() {
   h += "function startChg(){";
   h += "var v=parseFloat($('chgV').value),i=parseFloat($('chgI').value);";
   h += "if(!confirmStart('START CHARGING',v,i,true))return;";
-  h += "fetch('/charge?v='+v+'&i='+i).then(r=>r.json()).then(d=>{";
+  h += "fetchR('/charge?v='+v+'&i='+i).then(d=>{";
   h += "if(!d.ok)alert('ERROR: '+d.error);";
   h += "setTimeout(upd,500);}).catch(e=>alert('Error: '+e));}";
 
@@ -1653,7 +1563,7 @@ void sendMainPage() {
   h += "function startDis(){";
   h += "var v=parseFloat($('disV').value),i=parseFloat($('disI').value);";
   h += "if(!confirmStart('START DISCHARGING',v,i,false))return;";
-  h += "fetch('/discharge?v='+v+'&i='+i).then(r=>r.json()).then(d=>{";
+  h += "fetchR('/discharge?v='+v+'&i='+i).then(d=>{";
   h += "if(!d.ok)alert('ERROR: '+d.error);";
   h += "setTimeout(upd,500);}).catch(e=>alert('Error: '+e));}";
 
@@ -1663,50 +1573,14 @@ void sendMainPage() {
   h += "Charge: " + String(config.chargeCurrent,1) + "A\\nDischarge: " + String(config.dischargeCurrent,1) + "A\\n";
   h += "Cycles: " + String(config.numCycles) + "\\n\\nAre you sure?';";
   h += "if(!confirm(msg))return;";
-  h += "fetch('/cycle').then(r=>r.json()).then(d=>{";
+  h += "fetchR('/cycle').then(d=>{";
   h += "if(!d.ok)alert('ERROR: '+d.error);";
   h += "setTimeout(upd,500);}).catch(e=>alert('Error: '+e));}";
 
-  h += "function stop(){if(confirm('STOP the current test?')){fetch('/stop');setTimeout(upd,200)}}";
+  h += "function stop(){if(confirm('STOP the current test?')){fetchR('/stop').then(()=>setTimeout(upd,500)).catch(()=>{})}}";
   h += "function downloadCSV(){window.location.href='/download'}";
   h += "function deleteLog(){if(confirm('Delete all logged data?')){fetch('/deletelog').then(()=>updLog())}}";
-  h += "setInterval(upd,2000);setInterval(updThermal,1000);setInterval(updLog,5000);upd();updLog();setTimeout(updThermal,500);";
-  h += "</script></body></html>";
-
-  sendChunkedPage(h);
-}
-
-void sendThermalPage() {
-  yield();  // Allow other tasks before building page
-  String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-  h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  h += "<title>Thermal Camera</title><style>";
-  h += "*{margin:0;padding:0}body{background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;color:#fff}";
-  h += "canvas{image-rendering:pixelated;max-width:100%;border:2px solid #333}";
-  h += ".stats{display:flex;gap:30px;margin:20px;font-size:1.5em}";
-  h += ".stat{text-align:center}.label{font-size:0.6em;color:#888}";
-  h += ".tmin{color:#00f}.tmax{color:#f00}.tavg{color:#0f0}";
-  h += ".back{position:fixed;top:10px;left:10px;padding:10px 20px;background:#333;color:#fff;text-decoration:none;border-radius:5px}";
-  h += "</style></head><body>";
-  h += "<a href='/' class='back'>Back</a>";
-  h += "<h1 style='margin:20px;color:#0cf'>MLX90640 Thermal Camera</h1>";
-  h += "<canvas id='thermal' width='640' height='480'></canvas>";
-  h += "<div class='stats'>";
-  h += "<div class='stat'><div class='label'>MIN</div><div class='tmin' id='tmin'>--</div></div>";
-  h += "<div class='stat'><div class='label'>MAX</div><div class='tmax' id='tmax'>--</div></div>";
-  h += "<div class='stat'><div class='label'>AVG</div><div class='tavg' id='tavg'>--</div></div>";
-  h += "</div>";
-  h += "<script>";
-  h += "var canvas=document.getElementById('thermal'),ctx=canvas.getContext('2d');";
-  h += "function upd(){fetch('/thermaldata').then(r=>r.json()).then(d=>{";
-  h += "if(!d.data)return;var w=32,h=24,scale=20;";
-  h += "for(var y=0;y<h;y++){for(var x=0;x<w;x++){";
-  h += "ctx.fillStyle=d.colors[y*w+x];ctx.fillRect(x*scale,y*scale,scale,scale);}}";
-  h += "document.getElementById('tmin').innerText=d.min.toFixed(1)+'C';";
-  h += "document.getElementById('tmax').innerText=d.max.toFixed(1)+'C';";
-  h += "document.getElementById('tavg').innerText=d.avg.toFixed(1)+'C';";
-  h += "}).catch(()=>{})}";
-  h += "setInterval(upd,500);upd();";
+  h += "setInterval(upd,3000);setInterval(updLog,10000);upd();updLog();";
   h += "</script></body></html>";
 
   sendChunkedPage(h);
@@ -1762,8 +1636,8 @@ void sendSettingsPage() {
 
   h += "<div class='panel'><h2>Temperature Alarms</h2>";
   h += "<div class='two-col'>";
-  h += "<div class='form-row'><label>DS18B20 Alarm (C)</label><input type='number' id='temp' value='" + String(config.tempAlarm,0) + "'></div>";
-  h += "<div class='form-row'><label>Thermal Camera Alarm (C)</label><input type='number' id='therm' value='" + String(config.thermalAlarm,0) + "'></div>";
+  h += "<div class='form-row'><label>Temp Alarm (Remote T1)</label><input type='number' id='temp' value='" + String(config.tempAlarm,0) + "'></div>";
+  h += "<div class='form-row'><label>Thermal Alarm (Remote MLX Max)</label><input type='number' id='therm' value='" + String(config.thermalAlarm,0) + "'></div>";
   h += "</div></div>";
 
   h += "<div class='panel'><h2>Test Settings</h2>";
@@ -2234,7 +2108,7 @@ void handleStatus() {
   String j = "{\"v\":" + String(status.voltage, 3);
   j += ",\"i\":" + String(status.current, 2);
   j += ",\"p\":" + String(status.power, 1);
-  j += ",\"t\":" + String(status.temperature, 1);
+  j += ",\"t\":" + String(remoteDsTemp1, 1);
   j += ",\"wh\":" + String(status.totalWh, 2);
   j += ",\"ahc\":" + String(status.totalAhCharge, 4);
   j += ",\"ahd\":" + String(status.totalAhDischarge, 4);
@@ -2260,11 +2134,6 @@ void handleStatus() {
   j += ",\"setINeg\":" + String(status.setCurrentNeg, 2);
   j += ",\"cvMode\":" + String(status.cvMode ? "true" : "false");
   j += ",\"cableLoss\":" + String(status.cableLoss, 3);
-  // Thermal
-  j += ",\"mlx\":" + String(mlxConnected ? "true" : "false");
-  j += ",\"mlxMin\":" + String(mlxMin, 1);
-  j += ",\"mlxMax\":" + String(mlxMax, 1);
-  j += ",\"mlxAvg\":" + String(mlxAvg, 1);
   // Cycle history array
   j += ",\"cycleHistory\":[";
   for (int i = 0; i < cycleHistoryCount && i < MAX_CYCLE_HISTORY; i++) {
@@ -2277,27 +2146,13 @@ void handleStatus() {
     j += ",\"done\":" + String(cycleHistory[i].completed ? "true" : "false") + "}";
   }
   j += "]";
+  // Remote sensor board temps
+  j += ",\"remoteOnline\":" + String(remoteSensorOnline ? "true" : "false");
+  j += ",\"remoteT1\":" + String(remoteDsTemp1, 2);
+  j += ",\"remoteT2\":" + String(remoteDsTemp2, 2);
+  j += ",\"remoteMlxMax\":" + String(remoteMlxMax, 1);
+  j += ",\"remoteMlxAvg\":" + String(remoteMlxAvg, 1);
   j += ",\"err\":\"" + status.lastError + "\"}";
-  server.send(200, "application/json", j);
-}
-
-void handleThermalData() {
-  if (!mlxConnected) {
-    server.send(200, "application/json", "{\"error\":\"MLX90640 not connected\"}");
-    return;
-  }
-
-  String j = "{\"data\":true,\"min\":" + String(mlxMin, 1);
-  j += ",\"max\":" + String(mlxMax, 1);
-  j += ",\"avg\":" + String(mlxAvg, 1);
-  j += ",\"colors\":[";
-
-  for (int i = 0; i < MLX_PIXELS; i++) {
-    if (i > 0) j += ",";
-    j += "\"" + getThermalColor(mlxFrame[i], mlxMin, mlxMax) + "\"";
-  }
-  j += "]}";
-
   server.send(200, "application/json", j);
 }
 
@@ -2871,8 +2726,9 @@ void updateWhTest() {
 void deltaTask(void* param) {
   Serial.println("[CORE0] Delta task started");
 
-  // Initial Delta connection
-  delay(2000);  // Wait for WiFi to be fully stable
+  // Wait for WiFi to stabilize before first connect attempt
+  // Use vTaskDelay instead of delay() to not block Core 0 WiFi stack
+  vTaskDelay(3000 / portTICK_PERIOD_MS);
   deltaConnect();
   deltaTaskReady = true;
 
@@ -2883,6 +2739,10 @@ void deltaTask(void* param) {
     DeltaCmd cmd;
     while (xQueueReceive(deltaQueue, &cmd, 0) == pdTRUE) {
       deltaCommandBusy = true;
+      // User sent a command - reset backoff for immediate connect
+      deltaConnectFails = 0;
+      deltaBackoffMs = 0;
+      deltaNextConnectAllowed = 0;
       switch (cmd.type) {
         case DCMD_CHARGE_START: {
           Serial.printf("\n===== CHARGE %.2fV %.1fA =====\n", cmd.voltage, cmd.current);
@@ -3024,10 +2884,11 @@ void deltaTask(void* param) {
           }
         } else if (!stopRequested) {
           // Idle: quick V/I/P read for display + safety
+          // Use vTaskDelay between queries to give WiFi stack time on Core 0
           String vStr = deltaQuery("MEASure:VOLtage?");
-          yield();
+          vTaskDelay(20 / portTICK_PERIOD_MS);
           String iStr = deltaQuery("MEASure:CURrent?");
-          yield();
+          vTaskDelay(20 / portTICK_PERIOD_MS);
           String pStr = deltaQuery("MEASure:POWer?");
 
           if (vStr.length() > 0) {
@@ -3073,7 +2934,7 @@ void deltaTask(void* param) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n========== Battery Tester v7.5 - HARD SAFETY LIMITS ==========\n");
+  Serial.println("\n========== Battery Tester v7.8 - REST HOLD + REMOTE SENSOR ==========\n");
 
   initSPIFFS();
   loadConfig();
@@ -3092,18 +2953,6 @@ void setup() {
   es8311_init();
   i2s_init();
 
-  // Initialize MLX90640 on separate I2C bus (Wire1, GPIO 15/14)
-  Wire1.begin(MLX_SDA_PIN, MLX_SCL_PIN);
-  Wire1.setClock(400000);  // 400kHz for MLX90640
-  mlxConnected = mlxInit();
-  if (mlxConnected) {
-    Serial.println("[MLX] Thermal camera ready!");
-  } else {
-    Serial.println("[MLX] Not found - continuing without thermal");
-  }
-
-  tempSensor.begin();
-
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("WiFi");
@@ -3115,7 +2964,6 @@ void setup() {
 
   server.on("/", sendMainPage);
   server.on("/settings", sendSettingsPage);
-  server.on("/thermal", sendThermalPage);
   server.on("/sgs", sendSGSPage);
   server.on("/sgs/status", handleSGSStatus);
   server.on("/sgs/start", handleSGSStart);
@@ -3124,7 +2972,6 @@ void setup() {
   server.on("/whtest/status", handleWhTestStatus);
   server.on("/whtest/start", handleWhTestStart);
   server.on("/status", handleStatus);
-  server.on("/thermaldata", handleThermalData);
   server.on("/ping", handlePing);
   server.on("/charge", handleCharge);
   server.on("/discharge", handleDischarge);
@@ -3139,7 +2986,6 @@ void setup() {
   server.on("/safety/log", handleGetSafetyLog);
   server.begin();
 
-  readTemp();
   playTone(800, 100); playSilence(50); playTone(1000, 100); playSilence(50); playTone(1200, 150);
 
   // Create Delta command queue
@@ -3193,8 +3039,8 @@ void updateSGSTest() {
             status.currentCycle, status.current, sgsConfig.cutoffCurrent);
           playTone(1000, 150);
 
-          // Stop charging, start rest
-          quickDeltaOff();
+          // Stop charging, start rest - hold voltage to prevent sink current
+          deltaRestHold();
           sgsConfig.sgsCurrentPhase = 2; // Rest after charge
           sgsConfig.phaseStartTime = millis();
           Serial.printf("[SGS] Starting rest period (%d sec)\n", sgsConfig.restTimeSeconds);
@@ -3235,10 +3081,8 @@ void updateSGSTest() {
             voltageReached ? "voltage" : "current");
           playTone(600, 150);
 
-          // Stop discharging - IMMEDIATELY
-          quickDeltaOff();
-          delay(100);
-          quickDeltaOff();  // Double-tap for safety
+          // Stop discharging - hold voltage to prevent sink current
+          deltaRestHold();
 
           sgsConfig.sgsCurrentPhase = 4; // Rest after discharge
           sgsConfig.phaseStartTime = millis();
@@ -3289,62 +3133,45 @@ void updateSGSTest() {
 
 // ============== LOOP ==============
 
-// Quick Delta off - with verification
+// Quick Delta off - with proper SCPI response handling
+// Each command is sent and response is read before the next command
 void quickDeltaOff() {
-  Serial.println("[DELTA] Quick OFF - zeroing setpoints + output off");
+  Serial.println("[DELTA] Quick OFF - proper SCPI sequence");
+  // Reset backoff - safety operations always get immediate connect attempts
+  deltaConnectFails = 0;
+  deltaBackoffMs = 0;
+  deltaNextConnectAllowed = 0;
 
   for (int attempt = 0; attempt < 3; attempt++) {
-    // Reconnect if needed - safety is more important than speed
     if (!deltaClient.connected()) {
-      Serial.println("[DELTA] Quick OFF - reconnecting to Delta...");
+      Serial.printf("[DELTA] Quick OFF - reconnecting (attempt %d)...\n", attempt + 1);
       if (!deltaConnect()) {
-        Serial.println("[DELTA] Quick OFF - connect FAILED, retrying...");
+        Serial.println("[DELTA] Quick OFF - connect FAILED");
         delay(200);
+        deltaConnectFails = 0;
+        deltaNextConnectAllowed = 0;
         continue;
       }
     }
 
-    // CRITICAL SEQUENCE to prevent -1.64A sink:
-    // 1. Set voltage HIGH (above any battery) so Delta has no reason to sink
-    // 2. Zero all current limits
-    // 3. Turn output off
-    deltaClient.print("SOURce:VOLtage 5.00\r\n");  // Above any battery voltage
-    delay(100);
-    deltaClient.print("SOURce:CURrent 0\r\n");
-    delay(100);
-    deltaClient.print("SOURce:CURrent:NEGative 0\r\n");
-    delay(100);
-    deltaClient.print("SOURce:POWer 0\r\n");
-    delay(100);
-    deltaClient.print("SOURce:POWer:NEGative 0\r\n");
-    delay(100);
-    deltaClient.print("OUTPut OFF\r\n");
-    delay(200);
-    // Set voltage to 0 AFTER output is off
-    deltaClient.print("SOURce:VOLtage 0\r\n");
-    delay(100);
-    deltaClient.print("OUTPut OFF\r\n");
-    delay(300);
-    yield();
+    // Step 1: Zero current limits FIRST (using deltaSet which reads response)
+    deltaSet("SOURce:CURrent 0");
+    deltaSet("SOURce:CURrent:NEGative 0");
 
-    // Verify: read current to check output is actually off
-    while(deltaClient.available()) deltaClient.read();  // drain
-    deltaClient.print("MEASure:CURrent?\r\n");
-    delay(100);
-    String iStr = "";
-    unsigned long start = millis();
-    while (millis() - start < 800) {
-      if (deltaClient.available()) {
-        char c = deltaClient.read();
-        if (c == '\n' || c == '\r') { if (iStr.length() > 0) break; }
-        else if (c >= 32 && c <= 126) iStr += c;
-      } else { delay(5); }
-      yield();
-    }
+    // Step 2: Turn output OFF
+    deltaSet("OUTPut OFF");
 
+    // Step 3: Verify output state by querying OUTPut?
+    String outState = deltaQuery("OUTPut?");
+    Serial.printf("[DELTA] Quick OFF - OUTPut? = '%s'\n", outState.c_str());
+
+    // Step 4: Zero voltage (safe now because output is confirmed off)
+    deltaSet("SOURce:VOLtage 0");
+
+    // Step 5: Verify current
+    String iStr = deltaQuery("MEASure:CURrent?");
     if (iStr.length() == 0) {
-      Serial.printf("[DELTA] Quick OFF attempt %d: no response (Delta not responding)\n", attempt + 1);
-      // No response = Delta SCPI not working, force reconnect and try again
+      Serial.printf("[DELTA] Quick OFF attempt %d: no SCPI response\n", attempt + 1);
       deltaClient.stop();
       status.deltaConnected = false;
       delay(500);
@@ -3352,16 +3179,30 @@ void quickDeltaOff() {
     }
 
     float measI = iStr.toFloat();
-    Serial.printf("[DELTA] Quick OFF attempt %d: measured I=%.2fA\n", attempt + 1, measI);
+    Serial.printf("[DELTA] Quick OFF attempt %d: output=%s I=%.2fA\n", attempt + 1, outState.c_str(), measI);
 
-    // If current is near zero (< 0.5A), consider output off
     if (fabs(measI) < 0.5) {
-      Serial.println("[DELTA] Quick OFF - VERIFIED: output is off");
-      return;  // Keep connection alive!
+      Serial.println("[DELTA] Quick OFF - VERIFIED: output off, current ~0");
+      return;
     }
 
-    // Still drawing current - force reconnect and retry
-    Serial.printf("[DELTA] Quick OFF - STILL %.2fA! Retrying with fresh connection...\n", measI);
+    // Still current flowing - output might not be truly off
+    // Try again: send OUTPut OFF once more
+    Serial.printf("[DELTA] Quick OFF - still %.2fA, retrying OUTPut OFF...\n", measI);
+    deltaSet("OUTPut OFF");
+    delay(500);
+
+    iStr = deltaQuery("MEASure:CURrent?");
+    if (iStr.length() > 0) {
+      measI = iStr.toFloat();
+      Serial.printf("[DELTA] Quick OFF retry: I=%.2fA\n", measI);
+      if (fabs(measI) < 0.5) {
+        Serial.println("[DELTA] Quick OFF - VERIFIED on retry");
+        return;
+      }
+    }
+
+    // Force reconnect for next attempt
     deltaClient.stop();
     status.deltaConnected = false;
     delay(500);
@@ -3370,11 +3211,132 @@ void quickDeltaOff() {
   Serial.println("[DELTA] Quick OFF - WARNING: could not verify output off after 3 attempts!");
 }
 
+// Hold Delta at battery voltage during REST - prevents -1.64A sink current
+// Instead of output OFF (which still allows current through output stage),
+// we keep output ON at battery voltage with 0A current limits = no current flow
+void deltaRestHold() {
+  float holdV = status.voltage;
+  // Clamp to safe range
+  if (holdV < 2.5) holdV = 2.5;
+  if (holdV > 4.25) holdV = 4.25;
+
+  Serial.printf("[DELTA] REST HOLD - setting V=%.3f (battery voltage), I=0\n", holdV);
+
+  deltaConnectFails = 0;
+  deltaBackoffMs = 0;
+  deltaNextConnectAllowed = 0;
+
+  if (!deltaClient.connected()) {
+    if (!deltaConnect()) {
+      Serial.println("[DELTA] REST HOLD - connect failed, falling back to quickDeltaOff");
+      quickDeltaOff();
+      return;
+    }
+  }
+
+  // Set current limits to 0 first (safety)
+  deltaClient.print("SOURce:CURrent 0\r\n");
+  delay(50);
+  deltaClient.print("SOURce:CURrent:NEGative 0\r\n");
+  delay(50);
+  deltaClient.print("SOURce:POWer 0\r\n");
+  delay(50);
+  deltaClient.print("SOURce:POWer:NEGative 0\r\n");
+  delay(50);
+  // Set voltage to match battery (no potential difference = no current)
+  char vCmd[40];
+  snprintf(vCmd, sizeof(vCmd), "SOURce:VOLtage %.4f\r\n", holdV);
+  deltaClient.print(vCmd);
+  delay(50);
+  // Keep output ON - the active regulation prevents sink current
+  deltaClient.print("OUTPut ON\r\n");
+  delay(100);
+  yield();
+
+  // Verify current is near zero
+  while(deltaClient.available()) deltaClient.read();
+  deltaClient.print("MEASure:CURrent?\r\n");
+  delay(100);
+  String iStr = "";
+  unsigned long start = millis();
+  while (millis() - start < 800) {
+    if (deltaClient.available()) {
+      char c = deltaClient.read();
+      if (c == '\n' || c == '\r') { if (iStr.length() > 0) break; }
+      else if (c >= 32 && c <= 126) iStr += c;
+    } else { delay(5); }
+    yield();
+  }
+
+  if (iStr.length() > 0) {
+    float measI = iStr.toFloat();
+    Serial.printf("[DELTA] REST HOLD - measured I=%.2fA (should be ~0)\n", measI);
+  }
+}
+
+// Fetch temperatures from remote sensor board (second LyraT)
+// Uses lightweight raw WiFiClient instead of HTTPClient to save memory
+WiFiClient remoteClient;
+
+void fetchRemoteSensorData() {
+  if (millis() - lastRemoteFetch < REMOTE_FETCH_INTERVAL_MS) return;
+  lastRemoteFetch = millis();
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  remoteClient.setTimeout(2);  // 2 second timeout
+  if (!remoteClient.connect(REMOTE_SENSOR_IP, 80)) {
+    remoteSensorOnline = false;
+    return;
+  }
+
+  // Send minimal HTTP GET
+  remoteClient.print("GET /status HTTP/1.0\r\nHost: ");
+  remoteClient.print(REMOTE_SENSOR_IP);
+  remoteClient.print("\r\nConnection: close\r\n\r\n");
+
+  // Read response (skip headers, find JSON body)
+  String payload = "";
+  bool headersEnded = false;
+  unsigned long start = millis();
+  while (millis() - start < 2000) {
+    if (remoteClient.available()) {
+      String line = remoteClient.readStringUntil('\n');
+      if (!headersEnded) {
+        if (line.length() <= 2) headersEnded = true;  // Empty line = end of headers
+      } else {
+        payload += line;
+        break;  // JSON is one line
+      }
+    } else if (!remoteClient.connected()) {
+      break;
+    }
+    yield();
+  }
+  remoteClient.stop();
+
+  if (payload.length() > 5) {
+    remoteSensorOnline = true;
+    int idx;
+    idx = payload.indexOf("\"t1\":");
+    if (idx >= 0) remoteDsTemp1 = payload.substring(idx + 5).toFloat();
+    idx = payload.indexOf("\"t2\":");
+    if (idx >= 0) remoteDsTemp2 = payload.substring(idx + 5).toFloat();
+    idx = payload.indexOf("\"mlxMax\":");
+    if (idx >= 0) remoteMlxMax = payload.substring(idx + 9).toFloat();
+    idx = payload.indexOf("\"mlxAvg\":");
+    if (idx >= 0) remoteMlxAvg = payload.substring(idx + 9).toFloat();
+  } else {
+    remoteSensorOnline = false;
+  }
+}
+
 void loop() {
   // ============== CORE 1: Web server + Sensors + Logging ==============
   // Delta communication is handled by Core 0 - this loop NEVER blocks on Delta!
+  // CRITICAL: server.handleClient() must be called frequently (every <50ms)
+  // Temperature data comes from remote sensor board via WiFi
 
-  // Handle web requests - always responsive now
   server.handleClient();
   yield();
 
@@ -3386,35 +3348,38 @@ void loop() {
     digitalWrite(BLUE_LED_PIN, ledState ? HIGH : LOW);
   }
 
-  // Read thermal camera (Core 1 - I2C Wire1)
-  if (mlxConnected) {
-    mlxRead();
-    yield();
+  // Fetch remote sensor data (temperature from second LyraT board)
+  if (!status.running || (millis() - lastRemoteFetch > 10000)) {
+    fetchRemoteSensorData();
   }
 
-  // Read temperature + log data when running
+  // Update status.temperature from remote sensor
+  if (remoteSensorOnline && remoteDsTemp1 > -100) {
+    status.temperature = remoteDsTemp1;
+  }
+
+  // Periodic tasks: log data, safety checks
   static unsigned long lastSensorRead = 0;
   if (millis() - lastSensorRead >= 2000) {
     lastSensorRead = millis();
 
-    readTemp();
-    yield();
+    server.handleClient();
 
     // Log data when test is running and we have fresh measurements
     if (status.running) {
       appendLogEntry();
-      yield();
+      server.handleClient();
 
-      // Temperature safety checks (Core 1 has the temp data)
-      if (status.temperature > config.tempAlarm) {
-        status.lastError = "TEMP ALARM (DS18B20)";
+      // Temperature safety checks (using remote sensor data)
+      if (remoteSensorOnline && remoteDsTemp1 > config.tempAlarm) {
+        status.lastError = "TEMP ALARM (Remote T1): " + String(remoteDsTemp1, 1) + "C";
         stopRequested = true;
         DeltaCmd cmd = {DCMD_STOP, 0, 0};
         xQueueSend(deltaQueue, &cmd, 0);
         beepFail();
       }
-      if (mlxConnected && mlxMax > config.thermalAlarm) {
-        status.lastError = "THERMAL ALARM (MLX90640): " + String(mlxMax, 1) + "C";
+      if (remoteSensorOnline && remoteMlxMax > config.thermalAlarm) {
+        status.lastError = "THERMAL ALARM (Remote MLX): " + String(remoteMlxMax, 1) + "C";
         stopRequested = true;
         DeltaCmd cmd = {DCMD_STOP, 0, 0};
         xQueueSend(deltaQueue, &cmd, 0);
@@ -3428,13 +3393,6 @@ void loop() {
     }
   }
 
-  // Read temperature every 5 seconds when idle
-  static unsigned long lastIdleTemp = 0;
-  if (millis() - lastIdleTemp >= 5000 && !status.running) {
-    lastIdleTemp = millis();
-    readTemp();
-  }
-
-  delay(5);  // Minimal delay - web server needs to be fast
+  delay(2);  // Minimal delay
   yield();
 }
