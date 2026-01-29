@@ -13,13 +13,13 @@ I'm working on two ESP32 LyraT boards for battery testing:
 - **COM port**: COM4
 - **IP**: 192.168.1.40
 - **Version**: v7.8 "REST HOLD + REMOTE SENSOR"
-- **Code**: `src/main.cpp` (~3400 lines)
-- **Function**: Controls a Delta SM70-CP-450 bidirectional PSU (192.168.1.16:8462) via SCPI over TCP for battery charge/discharge cycling (SGS: charge → rest → discharge → rest)
+- **Code**: `src/main.cpp` (~3500 lines)
+- **Function**: Controls a Delta SM70-CP-450 bidirectional PSU (192.168.1.16:8462) via SCPI over TCP for battery charge/discharge cycling (SGS: charge -> rest -> discharge -> rest)
 - **Architecture**: Dual-core FreeRTOS
   - Core 0: WiFi + Delta SCPI communication task
   - Core 1: Arduino loop() with WebServer, logging, safety checks
 - **Web UI**: Shows voltage, current, elapsed time, 4 remote temps, cycle progress, Wh/CE%/EE% per cycle
-- **Safety**: Over-temp, over-voltage, over-current, thermal max alarms (all using remote sensor data)
+- **Safety**: Hard limits V:2.71-4.18V, over-temp, over-current alarms (all using remote sensor data)
 - **Logging**: CSV to SPIFFS with per-cycle Wh tracking
 
 ### 2. Sensor Board (repo: lyrat-temp-thermal)
@@ -35,36 +35,48 @@ I'm working on two ESP32 LyraT boards for battery testing:
 - **WiFi**: BTAC Medewerkers / Next3600$!
 
 ### Communication Flow
-Battery tester fetches `http://192.168.1.24/status` every 5 seconds using lightweight raw WiFiClient (not HTTPClient, which caused crashes at 98.3% flash usage).
+Battery tester fetches `http://192.168.1.24/status` every 5s using lightweight raw WiFiClient. Remote fetch is disabled until Delta is connected to prevent TCP stack contention. If sensor board is offline, backoff increases to 30s after 3 failures.
+
+---
+
+## Recent Changes (latest session)
+
+### SCPI Connection Fix
+The Delta's SCPI parser was getting stuck after abrupt TCP disconnects (e.g. ESP32 firmware upload). Confirmed by testing directly from PC - TCP connects but `*IDN?` gets no response. Fix:
+- **SCPI reset sequence**: On every new TCP connection, send `\r\n\r\n` + `*CLS` to flush stuck parser state before attempting `*IDN?`
+- **3x IDN retry**: If `*IDN?` gets no response, disconnect TCP, reconnect, reset, and retry (up to 3 attempts)
+- **Faster backoff**: Reduced max backoff from 30s to 10s (2s, 4s, 8s, 10s)
+- **Clear lastError**: `status.lastError` is now cleared on successful connect (was showing stale "SCPI NOT RESPONDING" on web UI even when connected)
+- **Remote fetch guard**: `fetchRemoteSensorData()` skips when `!status.deltaConnected` to prevent TCP stack contention during Delta connect phase
+
+### Known Issue
+Delta power cycle is still required if SCPI parser gets truly stuck (the reset sequence helps but can't fix all cases). After power cycle, the ESP32 connects within 2-5 attempts (Delta TCP port comes up before SCPI processor).
 
 ---
 
 ## Pending Tasks (in priority order)
 
 ### 1. DS18B20 GPIO Fix (Sensor Board)
-**Problem**: DS18B20 sensors are not detected. They are wired to GPIO 13 (TCK) which has JTAG circuitry on the LyraT that pulls the pin LOW, overriding the 4.7K pullup resistor. A `/rescan` confirms 0 devices found on all scanned GPIOs, and GPIO 13 idle state = LOW.
-
-**Fix**: Physically move the DS18B20 data wire from GPIO 13 to **GPIO 4** or **GPIO 27** (both are free and not JTAG-conflicted). Then update `ONE_WIRE_BUS` constant in `lyrat-temp-thermal/src/main.cpp`.
-
-**Status**: User said "kan er niet bij nu" (can't physically access the hardware right now).
+**Problem**: DS18B20 sensors not detected. GPIO 13 (TCK) has JTAG circuitry on LyraT pulling pin LOW, overriding 4.7K pullup.
+**Fix**: Move DS18B20 data wire from GPIO 13 to **GPIO 4** or **GPIO 27**. Update `ONE_WIRE_BUS` in `lyrat-temp-thermal/src/main.cpp`.
+**Status**: Waiting for physical hardware access.
 
 ### 2. Test deltaRestHold() (Battery Tester)
-**What**: During SGS REST phases, the code now calls `deltaRestHold()` instead of `quickDeltaOff()`. This keeps the Delta output ON but sets voltage = battery voltage and current limits = 0A, preventing the -1.64A sink current observed in v7.7.
-
-**Status**: Implemented but UNTESTED with Delta powered on. Needs a real SGS cycle test.
+**What**: During SGS REST phases, keeps Delta output ON at battery voltage with 0A current limits (instead of OUTPut OFF which caused -1.64A sink current in v7.7).
+**Status**: Implemented but UNTESTED. Needs real SGS cycle.
 
 ### 3. Test New quickDeltaOff() (Battery Tester)
-**What**: `quickDeltaOff()` was rewritten to use `deltaSet()`/`deltaQuery()` instead of flooding 8 SCPI commands without reading responses. The old version caused buffer overflow and commands (including OUTPut OFF) being dropped.
+**What**: Rewritten with proper SCPI response handling using `deltaSet()`/`deltaQuery()` instead of flooding 8 commands without reading responses.
+**Status**: Implemented but UNTESTED.
 
-**Status**: Implemented but UNTESTED with Delta powered on.
-
-### 4. Full SGS Cycle Test
-Run a complete SGS cycle (charge → rest → discharge → rest) with all v7.8 fixes and verify:
-- No -1.64A sink current during REST phases
-- deltaRestHold() correctly holds battery voltage with 0A
-- quickDeltaOff() properly shuts down at end of test
-- Remote sensor data flows correctly during cycle
+### 4. Full SGS Cycle Test (4 cycles)
+Verify with Delta powered on:
+- No sink current during REST phases
+- deltaRestHold() holds battery voltage correctly
+- quickDeltaOff() properly shuts down at end
+- Remote sensor data flows during cycle
 - Wh tracking and CE%/EE% calculations work
+- User wanted to run 4-cycle test but couldn't because of SCPI connection issues
 
 ---
 
@@ -72,25 +84,37 @@ Run a complete SGS cycle (charge → rest → discharge → rest) with all v7.8 
 
 ### Delta SM70-CP-450 SCPI
 - TCP connection to 192.168.1.16:8462
-- Commands use `deltaSet()` (send + read response) and `deltaQuery()` (send + return response)
-- SCPI interface boots slower than TCP port after power cycle - backoff mechanism handles this
+- Commands: `deltaSet()` (send + delay) and `deltaQuery()` (send + return response)
+- SCPI boots slower than TCP port - needs reset sequence + retry on new connections
 - Bidirectional: positive current = charge, negative current = discharge
-- OUTPut OFF doesn't physically disconnect - current can still flow through output stage
+- OUTPut OFF doesn't physically disconnect - current flows through output stage
+
+### SCPI Connection Sequence (deltaConnect)
+1. TCP connect with 1s timeout
+2. 300ms delay
+3. Send `\r\n\r\n` (flush partial commands) + `*CLS` (clear status)
+4. Send `*IDN?`, wait 2s for response
+5. If no response: disconnect, reconnect, repeat (up to 3 times)
+6. On success: reset backoff, clear lastError
 
 ### ESP32 LyraT Pin Constraints
 - GPIO 13 (TCK): JTAG - don't use for OneWire
-- GPIO 14 (TMS): Used for MLX SCL
-- GPIO 15 (TDO): Used for MLX SDA
+- GPIO 14 (TMS): Used for MLX SCL (sensor board)
+- GPIO 15 (TDO): Used for MLX SDA (sensor board)
 - GPIO 12 (TDI): JTAG - avoid
 - GPIO 22: Blue LED
 - GPIO 4, 27: Available for OneWire
 
-### Flash Usage
-- Battery tester: 87.0% (was 98.3% before removing local sensors and HTTPClient)
+### Flash/RAM Usage
+- Battery tester: Flash 87.1%, RAM 15.4%
 - Sensor board: ~75%
 
 ### PlatformIO
 - Build/upload: `C:\Users\KevinBtacseu\.platformio\penv\Scripts\pio.exe run -t upload`
 - Monitor: `pio.exe device monitor`
-- Battery tester upload_port: auto (COM4)
-- Sensor board upload_port: COM12
+- Battery tester: COM4 (auto-detected)
+- Sensor board: COM12 (hardcoded in platformio.ini)
+
+### GitHub Repos
+- Battery tester: https://github.com/KevinJonkman/Dinstinct-batt
+- Sensor board: https://github.com/KevinJonkman/lyrat-temp-thermal
