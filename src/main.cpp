@@ -68,6 +68,7 @@ DallasTemperature tempSensor(&oneWire);
 Preferences prefs;
 
 volatile bool stopRequested = false;
+volatile bool deltaBusy = false;  // Prevents re-entrant Delta operations
 
 // Blue LED status indicator
 unsigned long lastLedToggle = 0;
@@ -563,7 +564,8 @@ String deltaQuery(String cmd) {
 
   while ((millis() - start) < timeout) {
     yield();
-    // NO server.handleClient() here - prevents re-entrant SCPI corruption
+    // Safe: deltaBusy flag prevents re-entrant Delta operations from web handlers
+    server.handleClient();
 
     if (deltaClient.available()) {
       char c = deltaClient.read();
@@ -589,11 +591,12 @@ void deltaSet(String cmd) {
   if (!deltaClient.connected()) {
     if (!deltaConnect()) return;
   }
-  // NO server.handleClient() here - prevents re-entrant SCPI corruption
   deltaClient.print(cmd + "\r\n");
   deltaClient.flush();
-  delay(80);  // Give Delta time to process command
+  delay(80);
   yield();
+  // Safe: deltaBusy flag prevents re-entrant Delta operations from web handlers
+  server.handleClient();
 }
 
 bool deltaSetupCharge(float voltage, float current) {
@@ -735,34 +738,38 @@ bool deltaUpdateDischargeParams(float voltage, float current) {
 bool deltaReadMeasurements() {
   // Check stop FIRST
   if (stopRequested) return false;
-
-  // NO server.handleClient() here - prevents re-entrant SCPI corruption
+  deltaBusy = true;
   yield();
 
   if (!deltaClient.connected()) {
     if (!deltaConnect()) {
       status.measureFailCount++;
+      deltaBusy = false;
       return false;
     }
   }
 
-  // Check stop between each query
-  if (stopRequested) return false;
+  // Check stop between each query - handle web requests between (not inside) queries
+  if (stopRequested) { deltaBusy = false; return false; }
   String vStr = deltaQuery("MEASure:VOLtage?");
+  server.handleClient(); yield();
 
-  if (stopRequested) return false;
+  if (stopRequested) { deltaBusy = false; return false; }
   String iStr = deltaQuery("MEASure:CURrent?");
+  server.handleClient(); yield();
 
-  if (stopRequested) return false;
+  if (stopRequested) { deltaBusy = false; return false; }
   String pStr = deltaQuery("MEASure:POWer?");
+  server.handleClient(); yield();
 
   if (vStr.length() == 0) {
     status.measureFailCount++;
     if (status.measureFailCount >= 3) {
       Serial.println("[DELTA] Reconnecting...");
-      deltaConnect();
+      deltaForceReconnect();
       status.measureFailCount = 0;
     }
+    deltaBusy = false;
     return false;
   }
 
@@ -815,13 +822,16 @@ bool deltaReadMeasurements() {
     status.power = p;
 
     // Read programmed/set values - but check stop between each!
-    if (stopRequested) return false;
+    if (stopRequested) { deltaBusy = false; return false; }
+    server.handleClient(); yield();
     String setVStr = deltaQuery("SOURce:VOLtage?");
 
-    if (stopRequested) return false;
+    if (stopRequested) { deltaBusy = false; return false; }
+    server.handleClient(); yield();
     String setIStr = deltaQuery("SOURce:CURrent?");
 
-    if (stopRequested) return false;
+    if (stopRequested) { deltaBusy = false; return false; }
+    server.handleClient(); yield();
     String setINegStr = deltaQuery("SOURce:CURrent:NEGative?");
 
     if (setVStr.length() > 0) {
@@ -886,9 +896,11 @@ bool deltaReadMeasurements() {
     Serial.printf("[M] V=%.3f(set:%.2f) I=%.2f(set:%.1f) %s Loss=%.3fV\n",
       v, status.setVoltage, i, targetCurrent,
       status.cvMode ? "CV" : "CC", status.cableLoss);
+    deltaBusy = false;
     return true;
   }
 
+  deltaBusy = false;
   return false;
 }
 
@@ -1361,7 +1373,8 @@ void sendMainPage() {
   h += "<div class='seg-display'>";
   h += "<div class='seg-box'><div class='seg-label'>Voltage</div><div class='seg-value voltage' id='vBig'>--.---<span class='seg-unit'>V</span></div></div>";
   h += "<div class='seg-box'><div class='seg-label'>Current</div><div class='seg-value current' id='iBig'>--.--<span class='seg-unit'>A</span></div></div>";
-  h += "<div class='seg-box'><div class='seg-label'>Temperature</div><div class='seg-value' id='tBig'>--.-<span class='seg-unit'>°C</span></div></div>";
+  h += "<div class='seg-box'><div class='seg-label'>Temp DS18B20</div><div class='seg-value' id='tBig'>--.-<span class='seg-unit'>°C</span></div></div>";
+  h += "<div class='seg-box' style='border-color:#f80'><div class='seg-label'>Thermal Avg</div><div class='seg-value' id='tAvgBig' style='color:#f80;text-shadow:0 0 10px #f80'>--.-<span class='seg-unit'>°C</span></div></div>";
   h += "<div class='seg-box' style='border-color:#c80'><div class='seg-label'>Elapsed Time</div><div class='seg-value' id='elapsed' style='color:#c80;text-shadow:0 0 10px #c80'>00:00:00</div></div>";
   h += "</div>";
 
@@ -1446,7 +1459,7 @@ void sendMainPage() {
   h += "<div class='panel'><h2>Thermal Camera</h2>";
   h += "<div id='mlxStatus'>Checking...</div>";
   h += "<div class='thermal-container' id='thermalContainer' style='display:none'>";
-  h += "<canvas id='thermal' class='thermal-img' width='640' height='480' style='width:100%;max-width:640px;height:auto'></canvas>";
+  h += "<canvas id='thermal' class='thermal-img' width='320' height='240'></canvas>";
   h += "<div class='thermal-stats'>";
   h += "<div class='thermal-stat'><div class='label'>MIN</div><div class='val tmin' id='tmin'>--</div></div>";
   h += "<div class='thermal-stat'><div class='label'>MAX</div><div class='val tmax' id='tmax'>--</div></div>";
@@ -1534,6 +1547,7 @@ void sendMainPage() {
   h += "var iEl=$('iBig');iEl.innerHTML=d.i.toFixed(2)+'<span class=\"seg-unit\">A</span>';";
   h += "iEl.className='seg-value current'+(d.i<0?' negative':'');";
   h += "$('tBig').innerHTML=d.t.toFixed(1)+'<span class=\"seg-unit\">°C</span>';";
+  h += "if(d.mlx)$('tAvgBig').innerHTML=d.mlxAvg.toFixed(1)+'<span class=\"seg-unit\">°C</span>';";
   // Elapsed time display
   h += "$('elapsed').innerText=fmtTime(d.elapsed||0);";
   // Cards
@@ -2345,6 +2359,10 @@ void handleCharge() {
 
   // Live update if already charging - adjust Delta without stopping
   if (status.running && status.mode == MODE_CHARGE) {
+    if (deltaBusy) {
+      server.send(503, "application/json", "{\"ok\":false,\"error\":\"Delta busy - try again\"}");
+      return;
+    }
     logSafetyEvent("CHARGE LIVE UPDATE: V=" + String(v,2) + " I=" + String(i,1));
     if (deltaUpdateChargeParams(v, i)) {
       server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Parameters updated live\"}");
@@ -2374,6 +2392,10 @@ void handleDischarge() {
 
   // Live update if already discharging - adjust Delta without stopping
   if (status.running && status.mode == MODE_DISCHARGE) {
+    if (deltaBusy) {
+      server.send(503, "application/json", "{\"ok\":false,\"error\":\"Delta busy - try again\"}");
+      return;
+    }
     logSafetyEvent("DISCHARGE LIVE UPDATE: V=" + String(v,2) + " I=" + String(i,1));
     if (deltaUpdateDischargeParams(v, i)) {
       server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Parameters updated live\"}");
