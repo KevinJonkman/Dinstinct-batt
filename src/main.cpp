@@ -1,5 +1,5 @@
 /*
- * Battery Tester v7.5 - HARD SAFETY LIMITS + REMOTE SENSOR
+ * Battery Tester v8.0 - OTA + REMOTE LOGGING + REMOTE SENSOR
  * Based on v7.3 + CRITICAL safety fixes:
  * - Fixed SCPI response truncation (was cutting off at 4 chars)
  * - Added HARD voltage limits: IMMEDIATE stop if V < 2.70V or V > 4.15V
@@ -1225,7 +1225,7 @@ void sendMainPage() {
   yield();  // Allow other tasks before building page
   String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
   h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  h += "<title>Battery Tester v7.5</title>";
+  h += "<title>Battery Tester v8.0</title>";
   h += "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>";
   h += "<link href='https://fonts.googleapis.com/css2?family=DSEG7+Classic:wght@400;700&display=swap' rel='stylesheet'>";
   h += "<style>";
@@ -1266,7 +1266,7 @@ void sendMainPage() {
   h += "@media(max-width:900px){.main-grid{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}.controls{grid-template-columns:1fr}.seg-display{flex-direction:column;align-items:center}}";
   h += "</style></head><body>";
 
-  h += "<h1>Battery Tester v7.5</h1>";
+  h += "<h1>Battery Tester v8.0</h1>";
   h += "<div class='st' id='st'>Loading...</div>";
   h += "<div class='err' id='err' style='display:none'></div>";
 
@@ -2957,7 +2957,7 @@ void deltaTask(void* param) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n========== Battery Tester v7.8 - REST HOLD + REMOTE SENSOR ==========\n");
+  Serial.println("\n========== Battery Tester v8.0 - OTA + REMOTE LOGGING ==========\n");
 
   initSPIFFS();
   loadConfig();
