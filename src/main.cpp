@@ -25,6 +25,7 @@
 #include <Preferences.h>
 #include <SPIFFS.h>
 #include <FS.h>
+#include <ArduinoOTA.h>
 
 // FreeRTOS for dual-core Delta communication
 #include "freertos/FreeRTOS.h"
@@ -3008,6 +3009,19 @@ void setup() {
   server.on("/safety/log", handleGetSafetyLog);
   server.begin();
 
+  // ArduinoOTA
+  ArduinoOTA.setHostname("lyrat-battery");
+  ArduinoOTA.onStart([]() { Serial.println("[OTA] Start"); });
+  ArduinoOTA.onEnd([]() { Serial.println("[OTA] Done"); });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("[OTA] %u%%\r", progress * 100 / total);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("[OTA] Error %u\n", error);
+  });
+  ArduinoOTA.begin();
+  Serial.println("[OTA] Ready");
+
   playTone(800, 100); playSilence(50); playTone(1000, 100); playSilence(50); playTone(1200, 150);
 
   // Create Delta command queue
@@ -3315,6 +3329,7 @@ void loop() {
   // CRITICAL: server.handleClient() must be called frequently (every <50ms)
   // Temperature data comes from remote sensor board via WiFi
 
+  ArduinoOTA.handle();
   server.handleClient();
   yield();
 
