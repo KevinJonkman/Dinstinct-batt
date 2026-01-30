@@ -131,6 +131,7 @@ void beepStart();
 void beepStop();
 void beepFail();
 void beepDone();
+void sendRemoteLogCommand(const char* endpoint);
 
 enum TestMode { MODE_IDLE, MODE_CHARGE, MODE_DISCHARGE, MODE_CYCLE };
 
@@ -271,7 +272,7 @@ void startNewLog() {
   // Create new log file with header
   File f = SPIFFS.open(LOG_FILE, FILE_WRITE);
   if (f) {
-    f.println("timestamp,voltage,current,power,temp_remote_t1,temp_remote_mlx_max,mode,ah_charge,ah_discharge,wh");
+    f.println("timestamp,voltage,current,power,temp_remote_t1,temp_remote_t2,temp_remote_mlx_max,temp_remote_mlx_avg,mode,ah_charge,ah_discharge,wh");
     f.close();
     loggingEnabled = true;
     Serial.println("[LOG] New log started");
@@ -304,9 +305,9 @@ void appendLogEntry() {
   else if (status.mode == MODE_CYCLE) modeStr = status.current >= 0 ? "CYCLE_CHG" : "CYCLE_DIS";
 
   // Write CSV line
-  f.printf("%lu,%.4f,%.3f,%.2f,%.2f,%.2f,%s,%.4f,%.4f,%.3f\n",
+  f.printf("%lu,%.4f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%s,%.4f,%.4f,%.3f\n",
     elapsed, status.voltage, status.current, status.power,
-    status.temperature, remoteMlxMax, modeStr,
+    remoteDsTemp1, remoteDsTemp2, remoteMlxMax, remoteMlxAvg, modeStr,
     status.totalAhCharge, status.totalAhDischarge, status.totalWh);
   f.close();
 }
@@ -769,11 +770,11 @@ bool deltaSetupDischarge(float voltage, float current) {
   deltaSetValue("pset", "0");
   yield();
 
-  // Set negative (discharge) current and power
-  if (!deltaSetValue("isetneg", String(current, 2))) return false;
+  // Set negative (discharge) current and power (Delta requires negative values)
+  if (!deltaSetValue("isetneg", String(-current, 2))) return false;
   yield();
   float power = voltage * current * 1.5;
-  deltaSetValue("psetneg", String(power, 0));
+  deltaSetValue("psetneg", String(-power, 0));
   yield();
 
   delay(300);
@@ -820,10 +821,10 @@ bool deltaUpdateDischargeParams(float voltage, float current) {
 
   deltaSetValue("vset", String(voltage, 2));
   yield();
-  deltaSetValue("isetneg", String(current, 2));
+  deltaSetValue("isetneg", String(-current, 2));
   yield();
   float power = voltage * current * 1.5;
-  deltaSetValue("psetneg", String(power, 0));
+  deltaSetValue("psetneg", String(-power, 0));
   yield();
 
   Serial.printf("[DELTA] Live update done: %.2fV %.1fA\n", voltage, current);
@@ -855,7 +856,7 @@ bool deltaReadMeasurements() {
 
   // ============== HARD SAFETY LIMITS - IMMEDIATE STOP ==============
   #define HARD_MIN_VOLTAGE 2.70
-  #define HARD_MAX_VOLTAGE 4.15
+  #define HARD_MAX_VOLTAGE 4.20
 
   if (v > 0.5 && v < HARD_MIN_VOLTAGE && i < -0.5) {
     Serial.printf("\n!!! HARD SAFETY STOP: V=%.3fV < %.2fV (discharging) !!!\n", v, HARD_MIN_VOLTAGE);
@@ -1113,6 +1114,9 @@ void stopTest() {
   // Use quick off instead of full deltaStop
   quickDeltaOff();
   beepStop();
+
+  // Stop remote sensor board logging
+  sendRemoteLogCommand("stoplog");
 }
 
 void updateTest() {
@@ -1431,8 +1435,8 @@ void sendMainPage() {
   h += "$('vBig').innerHTML=d.v.toFixed(3)+'<span class=\"seg-unit\">V</span>';";
   h += "var iEl=$('iBig');iEl.innerHTML=d.i.toFixed(2)+'<span class=\"seg-unit\">A</span>';";
   h += "iEl.className='seg-value current'+(d.i<0?' negative':'');";
-  h += "$('tBig').innerHTML=(d.remoteOnline&&d.remoteT1>-100?d.remoteT1.toFixed(1):'--.-')+'<span class=\"seg-unit\">°C</span>';";
-  h += "$('tAvgBig').innerHTML=(d.remoteOnline&&d.remoteT2>-100?d.remoteT2.toFixed(1):'--.-')+'<span class=\"seg-unit\">°C</span>';";
+  h += "if(d.remoteT1>-100){$('tBig').innerHTML=d.remoteT1.toFixed(1)+'<span class=\"seg-unit\">°C</span>';}";
+  h += "if(d.remoteT2>-100){$('tAvgBig').innerHTML=d.remoteT2.toFixed(1)+'<span class=\"seg-unit\">°C</span>';}";
   // Elapsed time display
   h += "$('elapsed').innerText=fmtTime(d.elapsed||0);";
   // Cards
@@ -1442,12 +1446,10 @@ void sendMainPage() {
   h += "$('pwr').innerText=d.p.toFixed(1)+'W';";
   h += "$('cyc').innerText=d.cyc+'/'+d.ncyc;";
   // Remote sensor board - update seg-box displays
-  h += "if(d.remoteOnline){$('rSt').innerText='ONLINE';$('rSt').style.color='#0f0';";
-  h += "$('rMlxBig').innerHTML=d.remoteMlxMax.toFixed(1)+'<span class=\"seg-unit\">°C</span>';";
-  h += "$('rMlxAvgBig').innerHTML=(d.remoteMlxAvg||0).toFixed(1)+'<span class=\"seg-unit\">°C</span>';";
-  h += "}else{$('rSt').innerText='OFFLINE';$('rSt').style.color='#f44';";
-  h += "$('rMlxBig').innerHTML='--.-<span class=\"seg-unit\">°C</span>';";
-  h += "$('rMlxAvgBig').innerHTML='--.-<span class=\"seg-unit\">°C</span>';}";
+  h += "if(d.remoteOnline){$('rSt').innerText='ONLINE';$('rSt').style.color='#0f0';}";
+  h += "else{$('rSt').innerText='OFFLINE';$('rSt').style.color='#f44';}";
+  h += "if(d.remoteMlxMax>0){$('rMlxBig').innerHTML=d.remoteMlxMax.toFixed(1)+'<span class=\"seg-unit\">°C</span>';}";
+  h += "if((d.remoteMlxAvg||0)>0){$('rMlxAvgBig').innerHTML=d.remoteMlxAvg.toFixed(1)+'<span class=\"seg-unit\">°C</span>';}";
 
   // Cycle panel - show only during cycle mode (mode 3)
   h += "var cp=$('cyclePanel');";
@@ -2094,6 +2096,9 @@ void handleSGSStart() {
   status.mode = MODE_CYCLE;
   status.running = true;
 
+  // Start remote sensor board logging
+  sendRemoteLogCommand("startlog");
+
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -2649,6 +2654,9 @@ void handleWhTestStart() {
 
   logSafetyEvent("Wh Test started");
   beepStart();
+
+  // Start remote sensor board logging
+  sendRemoteLogCommand("startlog");
 
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Wh Test started\"}");
 }
@@ -3213,6 +3221,27 @@ void deltaRestHold() {
     Serial.println("[DELTA] REST HOLD - could not verify, falling back to quickDeltaOff");
     quickDeltaOff();
   }
+}
+
+// Fire-and-forget command to remote sensor board (start/stop logging)
+void sendRemoteLogCommand(const char* endpoint) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClient logClient;
+  logClient.setTimeout(1);
+  if (!logClient.connect(REMOTE_SENSOR_IP, 80)) {
+    Serial.printf("[REMOTE] Failed to connect for /%s\n", endpoint);
+    return;
+  }
+  logClient.printf("GET /%s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+    endpoint, REMOTE_SENSOR_IP);
+  // Don't wait for response - fire and forget
+  unsigned long t = millis();
+  while (logClient.connected() && millis() - t < 500) {
+    if (logClient.available()) { logClient.read(); break; }
+    yield();
+  }
+  logClient.stop();
+  Serial.printf("[REMOTE] Sent /%s\n", endpoint);
 }
 
 // Fetch temperatures from remote sensor board (second LyraT)
