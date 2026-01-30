@@ -2736,6 +2736,22 @@ void deltaTask(void* param) {
     unitType.trim();
     Serial.printf("[CORE0] Delta found via HTTP: %s\n", unitType.c_str());
     status.deltaConnected = true;
+
+    // Configure Delta sources to 'web' (HTTP CGI) instead of 'ethernet' (SCPI TCP)
+    // Without this, setConfiguration POST commands are accepted but not applied
+    String srcXml;
+    srcXml = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><SM15000><authentication><password><value></value></password></authentication><configuration><sources><voltage_source><value>web</value></voltage_source></sources></configuration></SM15000>";
+    deltaHttpPost("/cgi-bin/setConfiguration.cgi", srcXml);
+    srcXml = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><SM15000><authentication><password><value></value></password></authentication><configuration><sources><current_source><value>web</value></current_source></sources></configuration></SM15000>";
+    deltaHttpPost("/cgi-bin/setConfiguration.cgi", srcXml);
+    srcXml = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><SM15000><authentication><password><value></value></password></authentication><configuration><sources><power_source><value>web</value></power_source></sources></configuration></SM15000>";
+    deltaHttpPost("/cgi-bin/setConfiguration.cgi", srcXml);
+    Serial.println("[CORE0] Delta sources set to 'web'");
+
+    // Disable sink current when output is off (prevents -1.6A battery drain)
+    srcXml = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><SM15000><authentication><password><value></value></password></authentication><configuration><powersink><onoutput><value>disabled</value></onoutput></powersink></configuration></SM15000>";
+    deltaHttpPost("/cgi-bin/setConfiguration.cgi", srcXml);
+    Serial.println("[CORE0] Sink on output-off disabled");
   } else {
     Serial.println("[CORE0] Delta HTTP not reachable yet - will retry");
   }
