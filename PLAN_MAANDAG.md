@@ -175,7 +175,85 @@ De ESP32's sturen MQTT discovery messages zodat HA automatisch sensors aanmaakt.
 ### Repositories
 - Sensor Hub: https://github.com/KevinJonkman/lyrat-temp-thermal
 - Battery Tester: https://github.com/KevinJonkman/Dinstinct-batt
+- **BTAC-GLC org (bestaande HA/MQTT/ESPHome infra):**
+  - `BTAC-GLC/ha-config` — Volledige HA configuratie (YAML dashboards, MQTT sensors, InfluxDB, light groups)
+  - `BTAC-GLC/ESPHome-software` — ESPHome configs (BatSensor, HVAC, Water Level, shared configs)
+  - `BTAC-GLC/proto-mqtt` — Protobuf↔JSON MQTT bridge (Rust)
+  - `BTAC-GLC/ESPHome-devices` — Device definities
+  - `BTAC-GLC/has` — HA core fork
 
 ### Huidige versies
-- Sensor Hub: v9.0 (commit 6ce1f06)
-- Battery Tester: v8.0 (commit 702d07e)
+- Sensor Hub: v9.0 (commit de74eab)
+- Battery Tester: v8.0 (commit 4e3da8e)
+
+---
+
+## Wat er al bestaat in BTAC-GLC (om op voort te bouwen)
+
+### ha-config — bestaande patronen
+De HA instance heeft al:
+- **MQTT sensors** via `mqtt:` blok in configuration.yaml — topic formaat: `homeassistant/light/{id}/sensor/temp`
+- **YAML dashboards** (lovelace mode: yaml) met meerdere views (operator, technician, grower, lights, phases, energy)
+- **Custom cards:** bignumber-card, plotly-graph-card, apexcharts-card, timeslot-scheduler, plant-card
+- **InfluxDB** integratie (192.168.1.94, database "has") voor long-term storage
+- **Light groups** met cell/row/level/segment naamgeving
+- **Input helpers** (input_boolean, input_number, input_text, input_datetime)
+
+### ESPHome-software — bestaande patronen
+- **Shared configs** in `shared_configs/` (esphome.yaml, esp32.yaml, project_base.yaml)
+- **Sensor includes:** tmp117, scd4x, bme280, shtcx, bh1750
+- **BatSensor** device met I2C bus, GPIO buttons, RGB LED, switches
+- **Namensconventie:** `${cell}${row}${level}${segment}_sensorname`
+
+### proto-mqtt — MQTT bridge
+- Rust binary die MQTT berichten vertaalt van protobuf naar JSON
+- Kan als template dienen voor onze MQTT message structuur
+
+---
+
+## HA als backbone — voordelen voor battery tester
+
+Met HA als centraal punt kan de battery tester ESP32 eenvoudiger worden:
+
+### Nu (zonder HA)
+```
+Battery Tester ESP32:
+  - Delta PSU aansturing (Core 0)
+  - Webserver + UI (Core 1)
+  - Remote sensor polling (HTTP naar .24)
+  - Test logica (cycle, SGS, Wh test)
+  - Data logging (SPIFFS)
+  - Safety limits
+  → Alles in 1 ESP32, complex
+```
+
+### Straks (met HA backbone)
+```
+Battery Tester ESP32:
+  - Delta PSU aansturing (Core 0)
+  - MQTT publish (V, I, P, status)
+  - MQTT subscribe (start/stop commands)
+  → Veel simpeler
+
+Home Assistant:
+  - Dashboard (gauges, charts, camera)
+  - Automatiseringen (thermal safety, alerts)
+  - Data logging (InfluxDB, al aanwezig!)
+  - TTS via sensorboard speaker
+  - Push notificaties (mobiel, Discord)
+  - Hikvision camera snapshots bij events
+
+Sensor Hub ESP32:
+  - Temperatuur meting
+  - MQTT publish (T1, T2, MLX)
+  - Speaker (TTS via HA of direct)
+```
+
+### Wat dit oplevert
+1. **Minder code op ESP32** — geen webserver UI nodig, HA doet dashboard
+2. **InfluxDB logging** — gratis, onbeperkt, al draaiend op 192.168.1.94
+3. **Automatiseringen in YAML** — makkelijker te wijzigen dan C++ code
+4. **Camera integratie** — Hikvision snapshot bij alarm
+5. **Push notificaties** — mobiel/Discord bij events
+6. **Meerdere gebruikers** — HA dashboard via browser, geen ESP32 belasting
+7. **Herbruikbaar** — zelfde patronen als bestaande BTAC-GLC setup
