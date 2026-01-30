@@ -2112,6 +2112,7 @@ void handleSGSStop() {
 }
 
 void handleStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
   String j = "{\"v\":" + String(status.voltage, 3);
   j += ",\"i\":" + String(status.current, 2);
   j += ",\"p\":" + String(status.power, 1);
