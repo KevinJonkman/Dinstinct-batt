@@ -46,7 +46,7 @@
 const char* WIFI_SSID = "BTAC Medewerkers";
 const char* WIFI_PASS = "Next3600$!";
 const char* DELTA_IP = "192.168.1.27";
-const int DELTA_PORT = 8462;
+// Delta SM70-CP-450 uses HTTP CGI on port 80 (not SCPI TCP)
 const char* REMOTE_SENSOR_IP = "192.168.1.24";  // Second LyraT sensor board
 
 #define PA_ENABLE_PIN   21
@@ -63,13 +63,12 @@ const char* REMOTE_SENSOR_IP = "192.168.1.24";  // Second LyraT sensor board
 #define I2S_DIN_PIN     35
 
 WebServer server(80);
-WiFiClient deltaClient;
 Preferences prefs;
 
 volatile bool stopRequested = false;
 
 // ============== DUAL-CORE DELTA COMMUNICATION ==============
-// Core 0: Delta TCP/SCPI task (measurements, commands, safety)
+// Core 0: Delta HTTP/CGI task (measurements, commands, safety)
 // Core 1: Arduino loop (web server, sensors, display, logging)
 // Communication via FreeRTOS queue - web server NEVER blocks on Delta
 
@@ -98,10 +97,9 @@ volatile bool deltaTaskReady = false;
 volatile bool deltaCommandBusy = false;  // True while Delta task processes a command
 volatile unsigned long lastDeltaMeasureTime = 0;  // When Core 0 last read measurements
 
-// Delta connection backoff - prevents blocking Core 0 (and WiFi stack) with repeated connect attempts
-int deltaConnectFails = 0;                  // Consecutive connection failures
-unsigned long deltaNextConnectAllowed = 0;  // millis() when next connect attempt is allowed
-unsigned long deltaBackoffMs = 0;           // Current backoff delay in ms
+// Delta HTTP communication - stateless, no persistent connection needed
+// Output state tracked locally for toggle logic
+String lastKnownOutputState = "Off";  // "On" or "Off" from getMeasurements
 
 // Blue LED status indicator
 unsigned long lastLedToggle = 0;
@@ -503,250 +501,300 @@ void beepStop(){playTone(800,100);playSilence(100);playTone(600,100);}
 void beepDone(){playTone(800,150);playSilence(50);playTone(1000,150);playSilence(50);playTone(1200,150);playSilence(50);playTone(1500,400);}
 void beepThermalWarn(){playTone(2000,100);playSilence(100);playTone(2000,100);}
 
-// ============== DELTA COMMUNICATIE ==============
+// ============== DELTA HTTP CGI COMMUNICATION ==============
+// Delta SM70-CP-450 uses HTTP CGI interface on port 80
+// GET /cgi-bin/getMeasurements.cgi - read all measurements
+// POST /cgi-bin/setConfiguration.cgi - set values (voltage, current, output, etc.)
 
-bool deltaConnect() {
-  // Don't kill existing healthy connection
-  if (deltaClient.connected()) {
-    return true;
-  }
-
-  // BACKOFF: Don't attempt connect if we're in backoff period
-  // This prevents blocking Core 0 (and WiFi TCP/IP stack!) with repeated failed connects
-  if (deltaConnectFails > 0 && millis() < deltaNextConnectAllowed) {
-    return false;  // Silent fail - not time to retry yet
-  }
-
-  // Only stop if we need to reconnect
-  deltaClient.stop();
-  delay(50);
-  yield();
-
-  deltaClient.setTimeout(10);  // 10 sec timeout - Delta PSU is slow, needs time
-  if (!deltaClient.connect(DELTA_IP, DELTA_PORT)) {
-    deltaConnectFails++;
-    // Exponential backoff: 2s, 4s, 8s, 10s max
-    deltaBackoffMs = min(10000UL, (unsigned long)(2000 * (1 << min(deltaConnectFails - 1, 3))));
-    deltaNextConnectAllowed = millis() + deltaBackoffMs;
-    if (deltaConnectFails <= 3 || deltaConnectFails % 10 == 0) {
-      Serial.printf("[DELTA] Connect FAILED (%d fails, next retry in %lus)\n", deltaConnectFails, deltaBackoffMs / 1000);
-    }
-    status.deltaConnected = false;
-    return false;
-  }
-
-  status.deltaConnected = true;
-  delay(300);  // Give Delta time after TCP connect
-  yield();
-
-  // SCPI reset sequence: flush any stuck parser state from previous abrupt disconnect
-  // Send empty lines to clear partial command buffer, then *CLS to reset status
-  deltaClient.print("\n\n");
-  delay(100);
-  while(deltaClient.available()) deltaClient.read();  // Drain garbage
-  deltaClient.print("*CLS\n");
-  delay(100);
-  while(deltaClient.available()) deltaClient.read();  // Drain again
-
-  // Simple *IDN? check - single attempt, no complex retry logic
-  deltaClient.print("*IDN?\n");
-  delay(200);
-
-  String idn = "";
-  unsigned long start = millis();
-  while (millis() - start < 3000) {
-    if (deltaClient.available()) {
-      char c = deltaClient.read();
-      if (c == '\n' || c == '\r') { if (idn.length() > 0) break; }
-      else if (c >= 32 && c <= 126) idn += c;
-    } else { delay(10); }
-    yield();
-  }
-
-  if (idn.length() > 0) {
-    // SUCCESS - reset backoff and clear any old error
-    deltaConnectFails = 0;
-    deltaBackoffMs = 0;
-    deltaNextConnectAllowed = 0;
-    status.lastError = "";
-    Serial.printf("[DELTA] Connected OK - %s\n", idn.c_str());
-    return true;
-  }
-
-  // IDN failed but TCP connected - still allow usage (Delta may be slow to respond)
-  Serial.println("[DELTA] WARNING: *IDN? no response, but TCP connected - continuing anyway");
-  deltaConnectFails = 0;
-  deltaBackoffMs = 0;
-  deltaNextConnectAllowed = 0;
-  return true;
+// XML parsing helpers
+float extractXmlFloat(const String& xml, const String& field) {
+  int fieldStart = xml.indexOf("<" + field + ">");
+  if (fieldStart < 0) return 0;
+  int valueStart = xml.indexOf("<value>", fieldStart);
+  if (valueStart < 0) return 0;
+  valueStart += 7; // length of "<value>"
+  int valueEnd = xml.indexOf("</value>", valueStart);
+  if (valueEnd < 0) return 0;
+  return xml.substring(valueStart, valueEnd).toFloat();
 }
 
-// Force reconnect - resets backoff and forces immediate attempt
-bool deltaForceReconnect() {
-  deltaClient.stop();
-  delay(200);
-  status.deltaConnected = false;
-  // Reset backoff so we try immediately
-  deltaConnectFails = 0;
-  deltaBackoffMs = 0;
-  deltaNextConnectAllowed = 0;
-  return deltaConnect();
+String extractXmlString(const String& xml, const String& field) {
+  int fieldStart = xml.indexOf("<" + field + ">");
+  if (fieldStart < 0) return "";
+  int valueStart = xml.indexOf("<value>", fieldStart);
+  if (valueStart < 0) return "";
+  valueStart += 7;
+  int valueEnd = xml.indexOf("</value>", valueStart);
+  if (valueEnd < 0) return "";
+  return xml.substring(valueStart, valueEnd);
 }
 
-String deltaQuery(String cmd) {
-  if (!deltaClient.connected()) {
-    if (!deltaConnect()) return "";
-  }
-
-  // Drain any leftover bytes from previous responses
-  while(deltaClient.available()) deltaClient.read();
-
-  deltaClient.print(cmd + "\n");
-  deltaClient.flush();
-  delay(30);
-
-  String response = "";
+// Read HTTP response body from WiFiClient
+// Delta's Boa web server may send malformed headers (CR without LF)
+// So we read raw bytes and find the XML content by looking for "<?xml"
+String deltaReadHttpResponse(WiFiClient& client) {
+  String raw = "";
   unsigned long start = millis();
-  unsigned long timeout = 1500;  // Generous timeout for slow Delta
-
-  while ((millis() - start) < timeout) {
-    yield();
-    // No server.handleClient() here - Delta runs on Core 0, web on Core 1
-
-    if (deltaClient.available()) {
-      char c = deltaClient.read();
-      if (c == '\n' || c == '\r') {
-        if (response.length() > 0) break;
-      } else if (c >= 32 && c <= 126) {
-        response += c;
-      }
-      if (response.length() >= 30) break;
+  while (millis() - start < 5000) {
+    if (client.available()) {
+      char c = client.read();
+      raw += c;
+      // Check if we've read enough (response complete)
+      if (raw.length() > 100 && raw.endsWith("</SM15000>")) break;
+      if (raw.length() > 100 && raw.endsWith("</measurements>")) break;
+    } else if (!client.connected()) {
+      break;
     } else {
       delay(5);
     }
+    yield();
   }
+  client.stop();
 
-  response.trim();
-  if (response.length() > 0) {
-    status.lastDeltaSuccess = millis();
+  // Find XML content start
+  int xmlStart = raw.indexOf("<?xml");
+  if (xmlStart >= 0) {
+    return raw.substring(xmlStart);
   }
-  return response;
+  // Try finding just the root element (some responses may not have <?xml header)
+  int measStart = raw.indexOf("<measurements>");
+  if (measStart >= 0) {
+    return raw.substring(measStart);
+  }
+  int smStart = raw.indexOf("<SM15000>");
+  if (smStart >= 0) {
+    return raw.substring(smStart);
+  }
+  // Return everything after the first empty-ish line (end of headers)
+  // Handle both \r\n\r\n and \r\r patterns (malformed headers)
+  int bodyStart = raw.indexOf("\r\n\r\n");
+  if (bodyStart >= 0) return raw.substring(bodyStart + 4);
+  bodyStart = raw.indexOf("\r\r");
+  if (bodyStart >= 0) return raw.substring(bodyStart + 2);
+  bodyStart = raw.indexOf("\n\n");
+  if (bodyStart >= 0) return raw.substring(bodyStart + 2);
+
+  return raw;  // Return raw if we can't find headers/body split
 }
 
-void deltaSet(String cmd) {
-  if (!deltaClient.connected()) {
-    if (!deltaConnect()) return;
+// HTTP GET helper - returns response body
+String deltaHttpGet(String path) {
+  WiFiClient client;
+  client.setTimeout(10);
+  if (!client.connect(DELTA_IP, 80)) {
+    Serial.println("[DELTA] HTTP GET connect failed");
+    status.deltaConnected = false;
+    return "";
   }
-  deltaClient.print(cmd + "\n");
-  deltaClient.flush();
-  delay(80);
-  yield();
+  client.print("GET " + path + " HTTP/1.0\r\n");
+  client.print("Host: " + String(DELTA_IP) + "\r\n");
+  client.print("Connection: close\r\n\r\n");
+
+  String body = deltaReadHttpResponse(client);
+  if (body.length() > 0) {
+    status.deltaConnected = true;
+    status.lastDeltaSuccess = millis();
+  }
+  return body;
+}
+
+// HTTP POST helper - returns response body
+String deltaHttpPost(String path, const String& body) {
+  WiFiClient client;
+  client.setTimeout(10);
+  if (!client.connect(DELTA_IP, 80)) {
+    Serial.println("[DELTA] HTTP POST connect failed");
+    status.deltaConnected = false;
+    return "";
+  }
+  client.print("POST " + path + " HTTP/1.0\r\n");
+  client.print("Host: " + String(DELTA_IP) + "\r\n");
+  client.print("Content-Type: application/x-www-form-urlencoded\r\n");
+  client.print("Content-Length: " + String(body.length()) + "\r\n");
+  client.print("Connection: close\r\n\r\n");
+  client.print(body);
+
+  String resp = deltaReadHttpResponse(client);
+  if (resp.length() > 0) {
+    status.deltaConnected = true;
+    status.lastDeltaSuccess = millis();
+  }
+  return resp;
+}
+
+// Set a single value on Delta via HTTP POST
+bool deltaSetValue(const String& field, const String& value, const String& type = "float") {
+  String xml = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><SM15000>";
+  xml += "<authentication><password><value></value></password></authentication>";
+  xml += "<configuration><setting>";
+  xml += "<" + field + "><type>" + type + "</type><value>" + value + "</value></" + field + ">";
+  xml += "</setting></configuration></SM15000>";
+  String resp = deltaHttpPost("/cgi-bin/setConfiguration.cgi", xml);
+  if (resp.length() > 0) {
+    Serial.printf("[DELTA] Set %s=%s -> OK\n", field.c_str(), value.c_str());
+    return true;
+  }
+  Serial.printf("[DELTA] Set %s=%s -> FAILED\n", field.c_str(), value.c_str());
+  return false;
+}
+
+// Toggle output on Delta (only supports toggle, not set directly)
+bool deltaToggleOutput() {
+  String xml = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><SM15000>";
+  xml += "<authentication><password><value></value></password></authentication>";
+  xml += "<configuration><setting>";
+  xml += "<output><type>bool</type><value>toggle</value></output>";
+  xml += "</setting></configuration></SM15000>";
+  String resp = deltaHttpPost("/cgi-bin/setConfiguration.cgi", xml);
+  return resp.length() > 0;
+}
+
+// Set output to a specific state (On or Off) by reading current state and toggling if needed
+bool deltaSetOutput(bool on) {
+  // Read current output state
+  String resp = deltaHttpGet("/cgi-bin/getMeasurements.cgi");
+  if (resp.length() == 0) return false;
+  String outputState = extractXmlString(resp, "output");
+  lastKnownOutputState = outputState;
+  bool currentlyOn = (outputState == "On");
+
+  if (currentlyOn == on) {
+    Serial.printf("[DELTA] Output already %s\n", on ? "On" : "Off");
+    return true;  // Already in desired state
+  }
+
+  Serial.printf("[DELTA] Toggling output from %s to %s\n", outputState.c_str(), on ? "On" : "Off");
+  bool result = deltaToggleOutput();
+  if (result) {
+    lastKnownOutputState = on ? "On" : "Off";
+  }
+  return result;
+}
+
+// Read all measurements from Delta via HTTP GET
+bool deltaGetMeasurements() {
+  String resp = deltaHttpGet("/cgi-bin/getMeasurements.cgi");
+  if (resp.length() == 0) return false;
+
+  float vmon = extractXmlFloat(resp, "vmon");
+  float imon = extractXmlFloat(resp, "imon");
+  float pmon = extractXmlFloat(resp, "pmon");
+  float vset = extractXmlFloat(resp, "vset");
+  float iset = extractXmlFloat(resp, "iset");
+  float isetneg = extractXmlFloat(resp, "isetneg");
+  String outputState = extractXmlString(resp, "output");
+  lastKnownOutputState = outputState;
+
+  // Store set values
+  status.setVoltage = vset;
+  status.setCurrent = iset;
+  status.setCurrentNeg = isetneg;
+
+  return true;  // Successfully parsed; caller uses vmon/imon/pmon
+}
+
+// Force reconnect - not needed for HTTP (stateless), just reset status
+bool deltaForceReconnect() {
+  status.deltaConnected = false;
+  // Try a quick GET to verify Delta is reachable
+  String resp = deltaHttpGet("/cgi-bin/getMeasurements.cgi");
+  if (resp.length() > 0) {
+    status.deltaConnected = true;
+    return true;
+  }
+  return false;
 }
 
 bool deltaSetupCharge(float voltage, float current) {
   Serial.printf("[DELTA] Setup CHARGE: %.2fV %.1fA\n", voltage, current);
 
-  // Use existing connection if healthy, only reconnect if needed
-  if (!deltaClient.connected()) {
-    if (!deltaConnect()) return false;
-  }
-
-  yield();
-  deltaSet("OUTPut OFF");
-  delay(500);  // Extra time for Delta to turn off
+  // Turn output off first
+  deltaSetOutput(false);
+  delay(500);
   yield();
 
-  deltaSet("SYSTem:REMote:CV Remote");
+  // Set voltage and positive current
+  if (!deltaSetValue("vset", String(voltage, 2))) return false;
   yield();
-  deltaSet("SYSTem:REMote:CC Remote");
-  yield();
-  deltaSet("SYSTem:REMote:CP Remote");
+  if (!deltaSetValue("iset", String(current, 2))) return false;
   yield();
 
-  deltaSet("SOURce:VOLtage " + String(voltage, 2));
+  // Set negative current and power limits to 0 (charge only)
+  deltaSetValue("isetneg", "0");
   yield();
-  deltaSet("SOURce:CURrent " + String(current, 2));
-  yield();
+
   float power = voltage * current * 1.5;
-  deltaSet("SOURce:POWer " + String(power, 0));
+  deltaSetValue("pset", String(power, 0));
   yield();
-
-  deltaSet("SOURce:CURrent:NEGative 0");
-  yield();
-  deltaSet("SOURce:POWer:NEGative 0");
+  deltaSetValue("psetneg", "0");
   yield();
 
   delay(300);
-  deltaSet("OUTPut ON");
-  delay(500);  // Extra time for output to stabilize
+  // Turn output on
+  deltaSetOutput(true);
+  delay(500);
   yield();
 
-  String vSet = deltaQuery("SOURce:VOLtage?");
-  yield();
-  String iSet = deltaQuery("SOURce:CURrent?");
-  yield();
-  String pSet = deltaQuery("SOURce:POWer?");
-  Serial.printf("[DELTA] Set: V=%s I=%s P=%s\n", vSet.c_str(), iSet.c_str(), pSet.c_str());
-
-  // Verify Delta actually accepted the commands
-  if (vSet.length() == 0 && iSet.length() == 0) {
-    Serial.println("[DELTA] ERROR: Delta not responding to SCPI - charge setup FAILED!");
-    status.lastError = "Delta SCPI not responding - power cycle Delta!";
+  // Verify by reading measurements
+  String resp = deltaHttpGet("/cgi-bin/getMeasurements.cgi");
+  if (resp.length() == 0) {
+    Serial.println("[DELTA] ERROR: Delta not responding - charge setup FAILED!");
+    status.lastError = "Delta not responding - check connection!";
     return false;
   }
+
+  float setV = extractXmlFloat(resp, "vset");
+  float setI = extractXmlFloat(resp, "iset");
+  String outState = extractXmlString(resp, "output");
+  Serial.printf("[DELTA] Charge setup verified: V=%.2f I=%.1f Output=%s\n", setV, setI, outState.c_str());
+
   return true;
 }
 
 bool deltaSetupDischarge(float voltage, float current) {
   Serial.printf("[DELTA] Setup DISCHARGE: %.2fV %.1fA\n", voltage, current);
 
-  // Use existing connection if healthy, only reconnect if needed
-  if (!deltaClient.connected()) {
-    if (!deltaConnect()) return false;
-  }
-
-  yield();
-  deltaSet("OUTPut OFF");
-  delay(500);  // Extra time for Delta to turn off
+  // Turn output off first
+  deltaSetOutput(false);
+  delay(500);
   yield();
 
-  deltaSet("SYSTem:REMote:CV Remote");
-  yield();
-  deltaSet("SYSTem:REMote:CC Remote");
-  yield();
-  deltaSet("SYSTem:REMote:CP Remote");
+  // Set voltage
+  if (!deltaSetValue("vset", String(voltage, 2))) return false;
   yield();
 
-  deltaSet("SOURce:VOLtage " + String(voltage, 2));
+  // Set positive current to 0 (discharge only)
+  deltaSetValue("iset", "0");
   yield();
-  deltaSet("SOURce:CURrent 0");
-  yield();
-  deltaSet("SOURce:POWer 0");
+  deltaSetValue("pset", "0");
   yield();
 
-  deltaSet("SOURce:CURrent:NEGative -" + String(current, 2));
+  // Set negative (discharge) current and power
+  if (!deltaSetValue("isetneg", String(current, 2))) return false;
   yield();
-  float power = 70.0 * current * 1.5;
-  deltaSet("SOURce:POWer:NEGative -" + String(power, 0));
+  float power = voltage * current * 1.5;
+  deltaSetValue("psetneg", String(power, 0));
   yield();
 
   delay(300);
-  deltaSet("OUTPut ON");
-  delay(500);  // Extra time for output to stabilize
+  // Turn output on
+  deltaSetOutput(true);
+  delay(500);
   yield();
 
-  String vSet = deltaQuery("SOURce:VOLtage?");
-  yield();
-  String iNeg = deltaQuery("SOURce:CURrent:NEGative?");
-  yield();
-  String pNeg = deltaQuery("SOURce:POWer:NEGative?");
-  Serial.printf("[DELTA] Set: V=%s I-=%s P-=%s\n", vSet.c_str(), iNeg.c_str(), pNeg.c_str());
-
-  if (vSet.length() == 0 && iNeg.length() == 0) {
-    Serial.println("[DELTA] ERROR: Delta not responding to SCPI - discharge setup FAILED!");
-    status.lastError = "Delta SCPI not responding - power cycle Delta!";
+  // Verify by reading measurements
+  String resp = deltaHttpGet("/cgi-bin/getMeasurements.cgi");
+  if (resp.length() == 0) {
+    Serial.println("[DELTA] ERROR: Delta not responding - discharge setup FAILED!");
+    status.lastError = "Delta not responding - check connection!";
     return false;
   }
+
+  float setV = extractXmlFloat(resp, "vset");
+  float setINeg = extractXmlFloat(resp, "isetneg");
+  String outState = extractXmlString(resp, "output");
+  Serial.printf("[DELTA] Discharge setup verified: V=%.2f I-=%.1f Output=%s\n", setV, setINeg, outState.c_str());
+
   return true;
 }
 
@@ -754,16 +802,12 @@ bool deltaSetupDischarge(float voltage, float current) {
 bool deltaUpdateChargeParams(float voltage, float current) {
   Serial.printf("[DELTA] LIVE UPDATE CHARGE: %.2fV %.1fA\n", voltage, current);
 
-  if (!deltaClient.connected()) {
-    if (!deltaConnect()) return false;
-  }
-
-  deltaSet("SOURce:VOLtage " + String(voltage, 2));
+  deltaSetValue("vset", String(voltage, 2));
   yield();
-  deltaSet("SOURce:CURrent " + String(current, 2));
+  deltaSetValue("iset", String(current, 2));
   yield();
   float power = voltage * current * 1.5;
-  deltaSet("SOURce:POWer " + String(power, 0));
+  deltaSetValue("pset", String(power, 0));
   yield();
 
   Serial.printf("[DELTA] Live update done: %.2fV %.1fA\n", voltage, current);
@@ -774,16 +818,12 @@ bool deltaUpdateChargeParams(float voltage, float current) {
 bool deltaUpdateDischargeParams(float voltage, float current) {
   Serial.printf("[DELTA] LIVE UPDATE DISCHARGE: %.2fV %.1fA\n", voltage, current);
 
-  if (!deltaClient.connected()) {
-    if (!deltaConnect()) return false;
-  }
-
-  deltaSet("SOURce:VOLtage " + String(voltage, 2));
+  deltaSetValue("vset", String(voltage, 2));
   yield();
-  deltaSet("SOURce:CURrent:NEGative -" + String(current, 2));
+  deltaSetValue("isetneg", String(current, 2));
   yield();
-  float power = 70.0 * current * 1.5;
-  deltaSet("SOURce:POWer:NEGative -" + String(power, 0));
+  float power = voltage * current * 1.5;
+  deltaSetValue("psetneg", String(power, 0));
   yield();
 
   Serial.printf("[DELTA] Live update done: %.2fV %.1fA\n", voltage, current);
@@ -791,56 +831,37 @@ bool deltaUpdateDischargeParams(float voltage, float current) {
 }
 
 bool deltaReadMeasurements() {
-  // Runs on Core 0 - no server.handleClient() needed, Core 1 handles web
+  // Runs on Core 0 - uses HTTP GET to read all measurements in one request
   if (stopRequested) return false;
 
-  if (!deltaClient.connected()) {
-    if (!deltaConnect()) {
-      status.measureFailCount++;
-      return false;
-    }
-  }
-
-  if (stopRequested) return false;
-  String vStr = deltaQuery("MEASure:VOLtage?");
-  yield();
-
-  if (stopRequested) return false;
-  String iStr = deltaQuery("MEASure:CURrent?");
-  yield();
-
-  if (stopRequested) return false;
-  String pStr = deltaQuery("MEASure:POWer?");
-  yield();
-
-  if (vStr.length() == 0) {
+  String resp = deltaHttpGet("/cgi-bin/getMeasurements.cgi");
+  if (resp.length() == 0) {
     status.measureFailCount++;
-    if (status.measureFailCount >= 3) {
-      Serial.println("[DELTA] Reconnecting...");
-      deltaForceReconnect();
-      status.measureFailCount = 0;
-    }
+    status.deltaConnected = false;
     return false;
   }
 
   status.measureFailCount = 0;
+  status.deltaConnected = true;
 
-  float v = vStr.toFloat();
-  float i = iStr.toFloat();
-  float p = pStr.toFloat();
+  float v = extractXmlFloat(resp, "vmon");
+  float i = extractXmlFloat(resp, "imon");
+  float p = extractXmlFloat(resp, "pmon");
+  float vset = extractXmlFloat(resp, "vset");
+  float iset = extractXmlFloat(resp, "iset");
+  float isetneg = extractXmlFloat(resp, "isetneg");
+  String outputState = extractXmlString(resp, "output");
+  lastKnownOutputState = outputState;
 
   // ============== HARD SAFETY LIMITS - IMMEDIATE STOP ==============
-  // These limits are NON-NEGOTIABLE. If voltage is outside safe range,
-  // we IMMEDIATELY turn off Delta output, no matter what.
   #define HARD_MIN_VOLTAGE 2.70
   #define HARD_MAX_VOLTAGE 4.15
 
-  // LOW VOLTAGE HARD SAFETY - RE-ENABLED v7.5
   if (v > 0.5 && v < HARD_MIN_VOLTAGE && i < -0.5) {
     Serial.printf("\n!!! HARD SAFETY STOP: V=%.3fV < %.2fV (discharging) !!!\n", v, HARD_MIN_VOLTAGE);
-    deltaSet("OUTPut OFF");
+    deltaSetOutput(false);
     delay(100);
-    deltaSet("OUTPut OFF");
+    deltaSetOutput(false);
     stopRequested = true;
     status.running = false;
     status.mode = MODE_IDLE;
@@ -851,11 +872,10 @@ bool deltaReadMeasurements() {
   }
 
   if (v > HARD_MAX_VOLTAGE) {
-    // CRITICAL: Battery voltage too high! STOP IMMEDIATELY!
     Serial.printf("\n!!! HARD SAFETY STOP: V=%.3fV > %.2fV !!!\n", v, HARD_MAX_VOLTAGE);
-    deltaSet("OUTPut OFF");
+    deltaSetOutput(false);
     delay(100);
-    deltaSet("OUTPut OFF");  // Send twice to be sure
+    deltaSetOutput(false);
     stopRequested = true;
     status.running = false;
     status.mode = MODE_IDLE;
@@ -870,51 +890,24 @@ bool deltaReadMeasurements() {
     status.voltage = v;
     status.current = i;
     status.power = p;
+    status.setVoltage = vset;
+    status.setCurrent = iset;
+    status.setCurrentNeg = isetneg;
 
-    // Read programmed/set values
-    if (stopRequested) return false;
-    String setVStr = deltaQuery("SOURce:VOLtage?");
-    yield();
-
-    if (stopRequested) return false;
-    String setIStr = deltaQuery("SOURce:CURrent?");
-    yield();
-
-    if (stopRequested) return false;
-    String setINegStr = deltaQuery("SOURce:CURrent:NEGative?");
-
-    if (setVStr.length() > 0) {
-      status.setVoltage = setVStr.toFloat();
-    }
-    if (setIStr.length() > 0) {
-      status.setCurrent = setIStr.toFloat();
-    }
-    if (setINegStr.length() > 0) {
-      status.setCurrentNeg = abs(setINegStr.toFloat());
-    }
-
-    // Determine CV/CC mode based on whether we're at the voltage or current limit
-    // In CV mode: actual voltage ≈ set voltage, current varies
-    // In CC mode: actual current ≈ set current, voltage varies
+    // Determine CV/CC mode
     float targetCurrent = (i >= 0) ? status.setCurrent : status.setCurrentNeg;
-    float voltageDiff = abs(status.setVoltage - v);
-    float currentDiff = abs(targetCurrent - abs(i));
 
-    // If voltage is close to set point and current is not at limit -> CV mode
-    // If current is close to limit -> CC mode
     if (targetCurrent > 0.1) {
       float currentRatio = abs(i) / targetCurrent;
-      status.cvMode = (currentRatio < 0.95);  // CV if not at current limit
+      status.cvMode = (currentRatio < 0.95);
     } else {
-      status.cvMode = true;  // No current set, assume CV
+      status.cvMode = true;
     }
 
-    // Calculate cable loss (difference between set voltage and measured at sense)
-    // Only meaningful when charging (current > 0) and in CV mode
+    // Calculate cable loss
     if (i > 0.5 && status.cvMode) {
       status.cableLoss = status.setVoltage - v;
     } else if (i < -0.5) {
-      // During discharge, sense voltage is higher than "set" due to battery
       status.cableLoss = v - status.setVoltage;
     } else {
       status.cableLoss = 0;
@@ -925,14 +918,13 @@ bool deltaReadMeasurements() {
       status.totalWh += abs(p) * hours;
       if (i > 0.01) {
         status.totalAhCharge += i * hours;
-        status.cycleAhCharge += i * hours;  // Per-cycle tracking
-        sgsConfig.currentCycleWhCharge += abs(p) * hours;  // Wh tracking for efficiency
+        status.cycleAhCharge += i * hours;
+        sgsConfig.currentCycleWhCharge += abs(p) * hours;
       } else if (i < -0.01) {
         status.totalAhDischarge += abs(i) * hours;
-        status.cycleAhDischarge += abs(i) * hours;  // Per-cycle tracking
-        sgsConfig.currentCycleWhDischarge += abs(p) * hours;  // Wh tracking for efficiency
+        status.cycleAhDischarge += abs(i) * hours;
+        sgsConfig.currentCycleWhDischarge += abs(p) * hours;
       }
-      // Track peak temperature this cycle
       if (status.temperature > status.peakTempThisCycle) {
         status.peakTempThisCycle = status.temperature;
       }
@@ -942,9 +934,9 @@ bool deltaReadMeasurements() {
     }
     status.lastMeasureTime = millis();
 
-    Serial.printf("[M] V=%.3f(set:%.2f) I=%.2f(set:%.1f) %s Loss=%.3fV\n",
+    Serial.printf("[M] V=%.3f(set:%.2f) I=%.2f(set:%.1f) %s Loss=%.3fV Out=%s\n",
       v, status.setVoltage, i, targetCurrent,
-      status.cvMode ? "CV" : "CC", status.cableLoss);
+      status.cvMode ? "CV" : "CC", status.cableLoss, outputState.c_str());
     lastDeltaMeasureTime = millis();
     return true;
   }
@@ -962,24 +954,24 @@ void deltaStop() {
 }
 
 String deltaPing() {
-  Serial.println("[DELTA] PING");
+  Serial.println("[DELTA] PING via HTTP");
 
-  if (!deltaConnect()) {
-    beepFail();
-    return "FAIL: Cannot connect";
-  }
-
-  String idn = deltaQuery("*IDN?");
-  // Don't close connection - leave it for future use
-
-  if (idn.length() > 5) {
+  String resp = deltaHttpGet("/cgi-bin/getVersion.cgi");
+  if (resp.length() > 0) {
+    String unitType = extractXmlString(resp, "unittype");
+    String serial = extractXmlString(resp, "serial");
+    unitType.trim();
+    serial.trim();
     beepOK();
-    Serial.printf("[DELTA] IDN: %s\n", idn.c_str());
-    return "OK: " + idn;
+    String result = "OK: " + unitType + " S/N:" + serial;
+    Serial.printf("[DELTA] %s\n", result.c_str());
+    status.deltaConnected = true;
+    return result;
   }
 
   beepFail();
-  return "FAIL: No response";
+  status.deltaConnected = false;
+  return "FAIL: No HTTP response";
 }
 
 // ============== TEST CONTROL ==============
@@ -2735,10 +2727,18 @@ void updateWhTest() {
 void deltaTask(void* param) {
   Serial.println("[CORE0] Delta task started");
 
-  // Wait for WiFi to stabilize before first connect attempt
-  // Use vTaskDelay instead of delay() to not block Core 0 WiFi stack
+  // Wait for WiFi to stabilize before first HTTP attempt
   vTaskDelay(3000 / portTICK_PERIOD_MS);
-  deltaConnect();
+  // Verify Delta is reachable via HTTP
+  String resp = deltaHttpGet("/cgi-bin/getVersion.cgi");
+  if (resp.length() > 0) {
+    String unitType = extractXmlString(resp, "unittype");
+    unitType.trim();
+    Serial.printf("[CORE0] Delta found via HTTP: %s\n", unitType.c_str());
+    status.deltaConnected = true;
+  } else {
+    Serial.println("[CORE0] Delta HTTP not reachable yet - will retry");
+  }
   deltaTaskReady = true;
 
   unsigned long lastMeasure = 0;
@@ -2748,10 +2748,6 @@ void deltaTask(void* param) {
     DeltaCmd cmd;
     while (xQueueReceive(deltaQueue, &cmd, 0) == pdTRUE) {
       deltaCommandBusy = true;
-      // User sent a command - reset backoff for immediate connect
-      deltaConnectFails = 0;
-      deltaBackoffMs = 0;
-      deltaNextConnectAllowed = 0;
       switch (cmd.type) {
         case DCMD_CHARGE_START: {
           Serial.printf("\n===== CHARGE %.2fV %.1fA =====\n", cmd.voltage, cmd.current);
@@ -2868,68 +2864,61 @@ void deltaTask(void* param) {
     unsigned long measureInterval = status.running ? 2000 : 6000;
     if (millis() - lastMeasure >= measureInterval) {
       lastMeasure = millis();
-      if (deltaClient.connected() || deltaConnect()) {
+      if (status.running && !stopRequested) {
+        // Active test: full measurement read + test logic
+        deltaReadMeasurements();
+
+        // Run test state machine
         if (status.running && !stopRequested) {
-          // Active test: full measurement read + test logic
-          deltaReadMeasurements();
-
-          // Run test state machine (needs Delta access for phase transitions)
-          if (status.running && !stopRequested) {
-            if (sgsConfig.sgsTestActive) {
-              updateSGSTest();
-            } else if (whTest.active) {
-              updateWhTest();
-            } else {
-              // Normal mode - check test conditions
-              if (status.measureFailCount >= 10) {
-                status.lastError = "Communication lost";
-                quickDeltaOff();
-                status.running = false;
-                status.mode = MODE_IDLE;
-                beepFail();
-              }
-              // Temperature checks handled by Core 1
-            }
-          }
-        } else if (!stopRequested) {
-          // Idle: quick V/I/P read for display + safety
-          // Use vTaskDelay between queries to give WiFi stack time on Core 0
-          String vStr = deltaQuery("MEASure:VOLtage?");
-          vTaskDelay(20 / portTICK_PERIOD_MS);
-          String iStr = deltaQuery("MEASure:CURrent?");
-          vTaskDelay(20 / portTICK_PERIOD_MS);
-          String pStr = deltaQuery("MEASure:POWer?");
-
-          if (vStr.length() > 0) {
-            float v = vStr.toFloat();
-            float i = iStr.toFloat();
-            float p = pStr.toFloat();
-            if (v >= 0 && v <= 100) {
-              status.voltage = v;
-              status.current = i;
-              status.power = p;
-            }
-
-            // IDLE SAFETY MONITOR
-            if (v > 0.5 && v < HARD_MIN_VOLTAGE && i < -0.5) {
-              Serial.printf("\n!!! IDLE SAFETY: V=%.3fV < %.2fV while draining %.2fA !!!\n", v, HARD_MIN_VOLTAGE, i);
-              logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V I=" + String(i, 2) + "A");
+          if (sgsConfig.sgsTestActive) {
+            updateSGSTest();
+          } else if (whTest.active) {
+            updateWhTest();
+          } else {
+            if (status.measureFailCount >= 10) {
+              status.lastError = "Communication lost";
               quickDeltaOff();
-              delay(100);
-              quickDeltaOff();
-              status.lastError = "IDLE SAFETY: Battery below " + String(HARD_MIN_VOLTAGE, 2) + "V!";
-              beepFail();
-            }
-            if (v > HARD_MAX_VOLTAGE) {
-              Serial.printf("\n!!! IDLE SAFETY: V=%.3fV > %.2fV !!!\n", v, HARD_MAX_VOLTAGE);
-              logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V > max");
-              quickDeltaOff();
-              delay(100);
-              quickDeltaOff();
-              status.lastError = "IDLE SAFETY: Battery above " + String(HARD_MAX_VOLTAGE, 2) + "V!";
+              status.running = false;
+              status.mode = MODE_IDLE;
               beepFail();
             }
           }
+        }
+      } else if (!stopRequested) {
+        // Idle: read all measurements via single HTTP GET
+        String resp = deltaHttpGet("/cgi-bin/getMeasurements.cgi");
+        if (resp.length() > 0) {
+          status.deltaConnected = true;
+          float v = extractXmlFloat(resp, "vmon");
+          float i = extractXmlFloat(resp, "imon");
+          float p = extractXmlFloat(resp, "pmon");
+          lastKnownOutputState = extractXmlString(resp, "output");
+          if (v >= 0 && v <= 100) {
+            status.voltage = v;
+            status.current = i;
+            status.power = p;
+          }
+          status.setVoltage = extractXmlFloat(resp, "vset");
+          status.setCurrent = extractXmlFloat(resp, "iset");
+          status.setCurrentNeg = extractXmlFloat(resp, "isetneg");
+
+          // IDLE SAFETY MONITOR
+          if (v > 0.5 && v < HARD_MIN_VOLTAGE && i < -0.5) {
+            Serial.printf("\n!!! IDLE SAFETY: V=%.3fV < %.2fV while draining %.2fA !!!\n", v, HARD_MIN_VOLTAGE, i);
+            logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V I=" + String(i, 2) + "A");
+            quickDeltaOff();
+            status.lastError = "IDLE SAFETY: Battery below " + String(HARD_MIN_VOLTAGE, 2) + "V!";
+            beepFail();
+          }
+          if (v > HARD_MAX_VOLTAGE) {
+            Serial.printf("\n!!! IDLE SAFETY: V=%.3fV > %.2fV !!!\n", v, HARD_MAX_VOLTAGE);
+            logSafetyEvent("IDLE SAFETY STOP: V=" + String(v, 3) + "V > max");
+            quickDeltaOff();
+            status.lastError = "IDLE SAFETY: Battery above " + String(HARD_MAX_VOLTAGE, 2) + "V!";
+            beepFail();
+          }
+        } else {
+          status.deltaConnected = false;
         }
       }
     }
@@ -3142,82 +3131,39 @@ void updateSGSTest() {
 
 // ============== LOOP ==============
 
-// Quick Delta off - with proper SCPI response handling
-// Each command is sent and response is read before the next command
+// Quick Delta off via HTTP - zero all setpoints and turn output off
 void quickDeltaOff() {
-  Serial.println("[DELTA] Quick OFF - proper SCPI sequence");
-  // Reset backoff - safety operations always get immediate connect attempts
-  deltaConnectFails = 0;
-  deltaBackoffMs = 0;
-  deltaNextConnectAllowed = 0;
+  Serial.println("[DELTA] Quick OFF via HTTP");
 
   for (int attempt = 0; attempt < 3; attempt++) {
-    if (!deltaClient.connected()) {
-      Serial.printf("[DELTA] Quick OFF - reconnecting (attempt %d)...\n", attempt + 1);
-      if (!deltaConnect()) {
-        Serial.println("[DELTA] Quick OFF - connect FAILED");
-        delay(200);
-        deltaConnectFails = 0;
-        deltaNextConnectAllowed = 0;
-        continue;
-      }
-    }
+    // Zero current limits first
+    deltaSetValue("iset", "0");
+    deltaSetValue("isetneg", "0");
+    deltaSetValue("pset", "0");
+    deltaSetValue("psetneg", "0");
+    deltaSetValue("vset", "0");
 
-    // Step 1: Zero current limits FIRST (using deltaSet which reads response)
-    deltaSet("SOURce:CURrent 0");
-    deltaSet("SOURce:CURrent:NEGative 0");
+    // Turn output off
+    deltaSetOutput(false);
+    delay(300);
 
-    // Step 2: Turn output OFF
-    deltaSet("OUTPut OFF");
-
-    // Step 3: Verify output state by querying OUTPut?
-    String outState = deltaQuery("OUTPut?");
-    Serial.printf("[DELTA] Quick OFF - OUTPut? = '%s'\n", outState.c_str());
-
-    // Step 4: Zero voltage (safe now because output is confirmed off)
-    deltaSet("SOURce:VOLtage 0");
-
-    // Step 5: Verify current
-    String iStr = deltaQuery("MEASure:CURrent?");
-    if (iStr.length() == 0) {
-      Serial.printf("[DELTA] Quick OFF attempt %d: no SCPI response\n", attempt + 1);
-      deltaClient.stop();
-      status.deltaConnected = false;
-      delay(500);
-      continue;
-    }
-
-    float measI = iStr.toFloat();
-    Serial.printf("[DELTA] Quick OFF attempt %d: output=%s I=%.2fA\n", attempt + 1, outState.c_str(), measI);
-
-    if (fabs(measI) < 0.5) {
-      Serial.println("[DELTA] Quick OFF - VERIFIED: output off, current ~0");
-      return;
-    }
-
-    // Still current flowing - output might not be truly off
-    // Try again: send OUTPut OFF once more
-    Serial.printf("[DELTA] Quick OFF - still %.2fA, retrying OUTPut OFF...\n", measI);
-    deltaSet("OUTPut OFF");
-    delay(500);
-
-    iStr = deltaQuery("MEASure:CURrent?");
-    if (iStr.length() > 0) {
-      measI = iStr.toFloat();
-      Serial.printf("[DELTA] Quick OFF retry: I=%.2fA\n", measI);
+    // Verify
+    String resp = deltaHttpGet("/cgi-bin/getMeasurements.cgi");
+    if (resp.length() > 0) {
+      float measI = extractXmlFloat(resp, "imon");
+      String outState = extractXmlString(resp, "output");
+      Serial.printf("[DELTA] Quick OFF attempt %d: output=%s I=%.2fA\n", attempt + 1, outState.c_str(), measI);
       if (fabs(measI) < 0.5) {
-        Serial.println("[DELTA] Quick OFF - VERIFIED on retry");
+        Serial.println("[DELTA] Quick OFF - VERIFIED: output off, current ~0");
         return;
       }
+      Serial.printf("[DELTA] Quick OFF - still %.2fA, retrying...\n", measI);
+    } else {
+      Serial.printf("[DELTA] Quick OFF attempt %d: no HTTP response\n", attempt + 1);
     }
-
-    // Force reconnect for next attempt
-    deltaClient.stop();
-    status.deltaConnected = false;
     delay(500);
   }
-
-  Serial.println("[DELTA] Quick OFF - WARNING: could not verify output off after 3 attempts!");
+  Serial.println("[DELTA] Quick OFF - WARNING: could not verify after 3 attempts!");
 }
 
 // Hold Delta at battery voltage during REST - prevents -1.64A sink current
@@ -3225,61 +3171,31 @@ void quickDeltaOff() {
 // we keep output ON at battery voltage with 0A current limits = no current flow
 void deltaRestHold() {
   float holdV = status.voltage;
-  // Clamp to safe range
   if (holdV < 2.5) holdV = 2.5;
   if (holdV > 4.25) holdV = 4.25;
 
-  Serial.printf("[DELTA] REST HOLD - setting V=%.3f (battery voltage), I=0\n", holdV);
+  Serial.printf("[DELTA] REST HOLD via HTTP - V=%.3f, I=0\n", holdV);
 
-  deltaConnectFails = 0;
-  deltaBackoffMs = 0;
-  deltaNextConnectAllowed = 0;
-
-  if (!deltaClient.connected()) {
-    if (!deltaConnect()) {
-      Serial.println("[DELTA] REST HOLD - connect failed, falling back to quickDeltaOff");
-      quickDeltaOff();
-      return;
-    }
-  }
-
-  // Set current limits to 0 first (safety)
-  deltaClient.print("SOURce:CURrent 0\n");
-  delay(50);
-  deltaClient.print("SOURce:CURrent:NEGative 0\n");
-  delay(50);
-  deltaClient.print("SOURce:POWer 0\n");
-  delay(50);
-  deltaClient.print("SOURce:POWer:NEGative 0\n");
-  delay(50);
-  // Set voltage to match battery (no potential difference = no current)
-  char vCmd[40];
-  snprintf(vCmd, sizeof(vCmd), "SOURce:VOLtage %.4f\n", holdV);
-  deltaClient.print(vCmd);
-  delay(50);
-  // Keep output ON - the active regulation prevents sink current
-  deltaClient.print("OUTPut ON\n");
-  delay(100);
+  // Zero current limits first
+  deltaSetValue("iset", "0");
+  deltaSetValue("isetneg", "0");
+  deltaSetValue("pset", "0");
+  deltaSetValue("psetneg", "0");
+  // Set voltage to match battery
+  deltaSetValue("vset", String(holdV, 4));
+  // Keep output on
+  deltaSetOutput(true);
+  delay(200);
   yield();
 
-  // Verify current is near zero
-  while(deltaClient.available()) deltaClient.read();
-  deltaClient.print("MEASure:CURrent?\n");
-  delay(100);
-  String iStr = "";
-  unsigned long start = millis();
-  while (millis() - start < 800) {
-    if (deltaClient.available()) {
-      char c = deltaClient.read();
-      if (c == '\n' || c == '\r') { if (iStr.length() > 0) break; }
-      else if (c >= 32 && c <= 126) iStr += c;
-    } else { delay(5); }
-    yield();
-  }
-
-  if (iStr.length() > 0) {
-    float measI = iStr.toFloat();
+  // Verify
+  String resp = deltaHttpGet("/cgi-bin/getMeasurements.cgi");
+  if (resp.length() > 0) {
+    float measI = extractXmlFloat(resp, "imon");
     Serial.printf("[DELTA] REST HOLD - measured I=%.2fA (should be ~0)\n", measI);
+  } else {
+    Serial.println("[DELTA] REST HOLD - could not verify, falling back to quickDeltaOff");
+    quickDeltaOff();
   }
 }
 
