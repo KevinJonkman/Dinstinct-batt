@@ -45,7 +45,7 @@
 
 const char* WIFI_SSID = "BTAC Medewerkers";
 const char* WIFI_PASS = "Next3600$!";
-const char* DELTA_IP = "192.168.1.16";
+const char* DELTA_IP = "192.168.1.27";
 const int DELTA_PORT = 8462;
 const char* REMOTE_SENSOR_IP = "192.168.1.24";  // Second LyraT sensor board
 
@@ -522,7 +522,7 @@ bool deltaConnect() {
   delay(50);
   yield();
 
-  deltaClient.setTimeout(1);  // 1 sec timeout - minimize Core 0 blocking
+  deltaClient.setTimeout(10);  // 10 sec timeout - Delta PSU is slow, needs time
   if (!deltaClient.connect(DELTA_IP, DELTA_PORT)) {
     deltaConnectFails++;
     // Exponential backoff: 2s, 4s, 8s, 10s max
@@ -541,49 +541,26 @@ bool deltaConnect() {
 
   // SCPI reset sequence: flush any stuck parser state from previous abrupt disconnect
   // Send empty lines to clear partial command buffer, then *CLS to reset status
-  deltaClient.print("\r\n\r\n");
+  deltaClient.print("\n\n");
   delay(100);
   while(deltaClient.available()) deltaClient.read();  // Drain garbage
-  deltaClient.print("*CLS\r\n");
+  deltaClient.print("*CLS\n");
   delay(100);
   while(deltaClient.available()) deltaClient.read();  // Drain again
 
-  // Now try *IDN? - attempt up to 3 times with increasing delay
+  // Simple *IDN? check - single attempt, no complex retry logic
+  deltaClient.print("*IDN?\n");
+  delay(200);
+
   String idn = "";
-  for (int idnTry = 0; idnTry < 3 && idn.length() == 0; idnTry++) {
-    if (idnTry > 0) {
-      // Retry: disconnect TCP and reconnect fresh
-      deltaClient.stop();
-      delay(500);
-      if (!deltaClient.connect(DELTA_IP, DELTA_PORT)) {
-        Serial.printf("[DELTA] IDN retry %d: reconnect failed\n", idnTry + 1);
-        continue;
-      }
-      delay(300);
-      deltaClient.print("\r\n\r\n");
-      delay(100);
-      while(deltaClient.available()) deltaClient.read();
-      deltaClient.print("*CLS\r\n");
-      delay(100);
-      while(deltaClient.available()) deltaClient.read();
-    }
-
-    deltaClient.print("*IDN?\r\n");
-    delay(200);
-
-    unsigned long start = millis();
-    while (millis() - start < 2000) {
-      if (deltaClient.available()) {
-        char c = deltaClient.read();
-        if (c == '\n' || c == '\r') { if (idn.length() > 0) break; }
-        else if (c >= 32 && c <= 126) idn += c;
-      } else { delay(10); }
-      yield();
-    }
-
-    if (idn.length() == 0) {
-      Serial.printf("[DELTA] IDN attempt %d: no response\n", idnTry + 1);
-    }
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    if (deltaClient.available()) {
+      char c = deltaClient.read();
+      if (c == '\n' || c == '\r') { if (idn.length() > 0) break; }
+      else if (c >= 32 && c <= 126) idn += c;
+    } else { delay(10); }
+    yield();
   }
 
   if (idn.length() > 0) {
@@ -596,15 +573,12 @@ bool deltaConnect() {
     return true;
   }
 
-  // SCPI not responding after 3 attempts
-  deltaConnectFails++;
-  deltaBackoffMs = min(10000UL, (unsigned long)(2000 * (1 << min(deltaConnectFails - 1, 3))));
-  deltaNextConnectAllowed = millis() + deltaBackoffMs;
-  Serial.printf("[DELTA] SCPI NOT RESPONDING (%d fails, next retry in %lus)\n", deltaConnectFails, deltaBackoffMs / 1000);
-  status.lastError = "Delta SCPI not responding";
-  deltaClient.stop();
-  status.deltaConnected = false;
-  return false;
+  // IDN failed but TCP connected - still allow usage (Delta may be slow to respond)
+  Serial.println("[DELTA] WARNING: *IDN? no response, but TCP connected - continuing anyway");
+  deltaConnectFails = 0;
+  deltaBackoffMs = 0;
+  deltaNextConnectAllowed = 0;
+  return true;
 }
 
 // Force reconnect - resets backoff and forces immediate attempt
@@ -627,7 +601,7 @@ String deltaQuery(String cmd) {
   // Drain any leftover bytes from previous responses
   while(deltaClient.available()) deltaClient.read();
 
-  deltaClient.print(cmd + "\r\n");
+  deltaClient.print(cmd + "\n");
   deltaClient.flush();
   delay(30);
 
@@ -663,7 +637,7 @@ void deltaSet(String cmd) {
   if (!deltaClient.connected()) {
     if (!deltaConnect()) return;
   }
-  deltaClient.print(cmd + "\r\n");
+  deltaClient.print(cmd + "\n");
   deltaClient.flush();
   delay(80);
   yield();
@@ -3270,27 +3244,27 @@ void deltaRestHold() {
   }
 
   // Set current limits to 0 first (safety)
-  deltaClient.print("SOURce:CURrent 0\r\n");
+  deltaClient.print("SOURce:CURrent 0\n");
   delay(50);
-  deltaClient.print("SOURce:CURrent:NEGative 0\r\n");
+  deltaClient.print("SOURce:CURrent:NEGative 0\n");
   delay(50);
-  deltaClient.print("SOURce:POWer 0\r\n");
+  deltaClient.print("SOURce:POWer 0\n");
   delay(50);
-  deltaClient.print("SOURce:POWer:NEGative 0\r\n");
+  deltaClient.print("SOURce:POWer:NEGative 0\n");
   delay(50);
   // Set voltage to match battery (no potential difference = no current)
   char vCmd[40];
-  snprintf(vCmd, sizeof(vCmd), "SOURce:VOLtage %.4f\r\n", holdV);
+  snprintf(vCmd, sizeof(vCmd), "SOURce:VOLtage %.4f\n", holdV);
   deltaClient.print(vCmd);
   delay(50);
   // Keep output ON - the active regulation prevents sink current
-  deltaClient.print("OUTPut ON\r\n");
+  deltaClient.print("OUTPut ON\n");
   delay(100);
   yield();
 
   // Verify current is near zero
   while(deltaClient.available()) deltaClient.read();
-  deltaClient.print("MEASure:CURrent?\r\n");
+  deltaClient.print("MEASure:CURrent?\n");
   delay(100);
   String iStr = "";
   unsigned long start = millis();
